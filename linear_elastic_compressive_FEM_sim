@@ -69,11 +69,13 @@ class SimulationParameters:
     
     Optimized defaults for fast testing:
     - Fewer steps for quick iteration
-    - Moderate forces to avoid excessive computation
+    - Forces sufficient to reach realistic compressive strengths (15-20 MPa)
     - Reasonable element size for balance between speed and accuracy
+    
+    Note: For typical 1 m² cross-section, 20 MN force ≈ 20 MPa stress
     """
     
-    max_force: float = 5000000.0  # N (5 MN default - reduced for fast testing)
+    max_force: float = 20000000.0  # N (20 MN default - sufficient for ~20 MPa stress on 1 m² area)
     num_steps: int = 5  # Reduced for fast testing
     element_size: float = 0.05  # m (balanced for speed/accuracy)
 
@@ -475,7 +477,7 @@ def main():
     parser.add_argument("stl_file", type=str, help="Path to input STL file")
     parser.add_argument("--output-dir", type=str, default="compression_results", help="Output directory")
     parser.add_argument("--element-size", type=float, default=0.05, help="Mesh element size (m) - larger = faster but less accurate")
-    parser.add_argument("--max-force", type=float, default=5000000.0, help="Maximum force to apply (N) - default 5 MN for fast testing")
+    parser.add_argument("--max-force", type=float, default=20000000.0, help="Maximum force to apply (N) - default 20 MN for realistic stress levels (~20 MPa on 1 m²)")
     parser.add_argument("--num-steps", type=int, default=5, help="Number of load steps - default 5 for fast testing")
     
     args = parser.parse_args()
