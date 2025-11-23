@@ -26,15 +26,15 @@ from mazers_model_active import (
 # Configuration - modify these to change the parameter sweep
 # Using active_gyroid_gen parameters
 
-# Unit cell sizes to test (mm) - all parameters kept
-UNIT_CELL_SIZES = [3.0, 4.0]  # mm
+# Unit cell sizes to test (mm) - minimal for simple test
+UNIT_CELL_SIZES = [3.0]  # mm
 
-# Wall thickness values to test (mm) - all parameters kept
-WALL_THICKNESSES = [0.4, 0.5]  # mm
+# Wall thickness values to test (mm) - minimal for simple test
+WALL_THICKNESSES = [0.4]  # mm
 
-# Porosity ranges to test - all parameters kept
-POROSITY_MIN_VALUES = [0.3, 0.4]  # Minimum porosity
-POROSITY_MAX_VALUES = [0.6, 0.7]  # Maximum porosity
+# Porosity ranges to test - minimal for simple test
+POROSITY_MIN_VALUES = [0.3]  # Minimum porosity
+POROSITY_MAX_VALUES = [0.6]  # Maximum porosity
 
 # Fixed parameters for all structures - computational settings reduced for testing
 NUMX = 3  # Number of unit cells in x (reduced from 5 for speed)
