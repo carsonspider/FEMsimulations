@@ -6,13 +6,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
 
-# Use existing STL files or skip generation for now
-# from active_gyroid_gen import (
-#     GyroidParameters,
-#     DEFAULT_PARAMS,
-#     create_gyroid,
-#     validate_params
-# )
+# Import gyroid generation functions
+from active_gyroid_gen import (
+    GyroidParameters,
+    create_gyroid,
+    validate_params
+)
 
 # Import simulation functions from mazers_model_active
 from mazers_model_active import (
@@ -56,36 +55,47 @@ SIM_NUM_STEPS = 3  # Reduced steps for quick test
 OUTPUT_CSV = 'dataset_full.csv'
 TEMP_DIR = Path('temp_sweep_files')
 TEMP_DIR.mkdir(exist_ok=True)
+GYROID_OUTPUT_DIR = Path('gyroid_outputs')
+GYROID_OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 def generate_gyroid_structure(unit_cell_size: float, wall_thickness: float, 
                                porosity_min: float, porosity_max: float, 
                                output_stl_path: Path) -> Tuple[bool, Path]:
-    """Use existing STL files for testing - skips generation to avoid dependencies."""
-    # Use existing STL files for parameter sweep testing
-    # This allows testing the simulation pipeline without gyroid generation dependencies
-    
-    # Check for existing STL files
-    existing_stls = []
-    if Path('.').exists():
-        existing_stls.extend(list(Path('.').glob('*.stl')))
-    if Path('gyroid_outputs').exists():
-        existing_stls.extend(list(Path('gyroid_outputs').glob('*.stl')))
-    if Path('optimized_gyroids').exists():
-        existing_stls.extend(list(Path('optimized_gyroids').glob('*.stl')))
-    
-    if existing_stls:
-        # Cycle through available STLs for different parameter combinations
-        stl_index = hash((unit_cell_size, wall_thickness, porosity_min, porosity_max)) % len(existing_stls)
-        test_stl = existing_stls[stl_index]
-        print(f"Using existing STL for testing: {test_stl.name}")
-        print(f"  (Parameters: cell_size={unit_cell_size}mm, wall={wall_thickness}mm, "
-              f"porosity=[{porosity_min:.2f}, {porosity_max:.2f}])")
-        return True, test_stl
-    else:
-        print(f"⚠ No existing STL files found. Skipping generation.")
-        print(f"  Parameters: cell_size={unit_cell_size}mm, wall={wall_thickness}mm, "
+    """Generate gyroid STL file with given parameters."""
+    try:
+        # Create gyroid parameters
+        params = GyroidParameters(
+            numx=NUMX,
+            numy=NUMY,
+            numz=NUMZ,
+            unit_cell_size=unit_cell_size,
+            nsteps=NSTEPS,
+            porosity_min=porosity_min,
+            porosity_max=porosity_max,
+            grad=GRAD,
+            func_degree=FUNC_DEGREE,
+            delta=DELTA,
+            smoothness=SMOOTHNESS,
+            marching_step=MARCHING_STEP,
+            wall_thickness=wall_thickness
+        )
+        
+        # Validate parameters
+        params = validate_params(params)
+        
+        # Generate gyroid and create STL
+        print(f"Generating gyroid: cell_size={unit_cell_size}mm, wall={wall_thickness}mm, "
               f"porosity=[{porosity_min:.2f}, {porosity_max:.2f}]")
+        stl_path = create_gyroid(params, GYROID_OUTPUT_DIR)
+        
+        print(f"✓ Generated STL: {stl_path.name}")
+        return True, stl_path
+            
+    except Exception as e:
+        print(f"✗ Error generating gyroid: {e}")
+        import traceback
+        traceback.print_exc()
         return False, output_stl_path
 
 
@@ -172,68 +182,71 @@ def main():
                     success, actual_stl_path = generate_gyroid_structure(
                         unit_cell_size, wall_thickness, porosity_min, porosity_max, stl_path
                     )
-                    if not success:
-                        print(f"Skipping simulation due to generation failure")
-                        # Still record in CSV with error flag
-                        csv_rows.append({
+                if not success:
+                    print(f"Skipping simulation due to generation failure")
+                    # Still record in CSV with error flag
+                    csv_rows.append({
                             'unit_cell_size_mm': unit_cell_size,
                             'wall_thickness_mm': wall_thickness,
                             'porosity_min': porosity_min,
                             'porosity_max': porosity_max,
-                            'compressive_strength_MPa': None,
-                            'max_force_N': None,
-                            'cross_sectional_area_m2': None,
-                            'energy_absorption_J': None,
-                            'max_displacement_mm': None,
-                            'max_strain': None,
-                            'status': 'generation_failed',
-                        })
-                        continue
+                            'stl_path': None,
+                        'compressive_strength_MPa': None,
+                        'max_force_N': None,
+                        'cross_sectional_area_m2': None,
+                        'energy_absorption_J': None,
+                        'max_displacement_mm': None,
+                        'max_strain': None,
+                        'status': 'generation_failed',
+                    })
+                    continue
+            
+                # Use the actual path that was created
+                stl_path = actual_stl_path
                 
-                    # Use the actual path that was created
-                    stl_path = actual_stl_path
-                    
-                    # Run simulation
-                    results = run_simulation(stl_path)
-                    
-                    if results is None:
-                        print(f"⚠ Skipping CSV entry due to simulation failure")
-                        # Still record in CSV with error flag
-                        csv_rows.append({
+                # Run simulation
+                results = run_simulation(stl_path)
+                
+                if results is None:
+                    print(f"⚠ Skipping CSV entry due to simulation failure")
+                    # Still record in CSV with error flag
+                    csv_rows.append({
                             'unit_cell_size_mm': unit_cell_size,
                             'wall_thickness_mm': wall_thickness,
                             'porosity_min': porosity_min,
                             'porosity_max': porosity_max,
-                            'compressive_strength_MPa': None,
-                            'max_force_N': None,
-                            'cross_sectional_area_m2': None,
-                            'energy_absorption_J': None,
-                            'max_displacement_mm': None,
-                            'max_strain': None,
-                            'status': 'simulation_failed',
-                        })
-                        continue
-                    
-                    # Extract summary results
-                    summary = extract_results_summary(results)
-                    
-                    # Add input parameters
-                    row = {
+                            'stl_path': str(stl_path) if stl_path.exists() else None,
+                        'compressive_strength_MPa': None,
+                        'max_force_N': None,
+                        'cross_sectional_area_m2': None,
+                        'energy_absorption_J': None,
+                        'max_displacement_mm': None,
+                        'max_strain': None,
+                        'status': 'simulation_failed',
+                    })
+                    continue
+                
+                # Extract summary results
+                summary = extract_results_summary(results)
+                
+                # Add input parameters
+                row = {
                         'unit_cell_size_mm': unit_cell_size,
                         'wall_thickness_mm': wall_thickness,
                         'porosity_min': porosity_min,
                         'porosity_max': porosity_max,
-                        **summary,
-                        'status': 'success',
-                    }
-                    
-                    csv_rows.append(row)
-                    
-                    # Print summary
-                    print(f"Results: Compressive strength = {summary['compressive_strength_MPa']:.2f} MPa")
-                    
-                    # Clean up STL file to save space (optional - comment out if you want to keep them)
-                    # stl_path.unlink()
+                        'stl_path': str(stl_path),  # STL file path
+                    **summary,
+                    'status': 'success',
+                }
+                
+                csv_rows.append(row)
+                
+                # Print summary
+                print(f"Results: Compressive strength = {summary['compressive_strength_MPa']:.2f} MPa")
+                
+                # Clean up STL file to save space (optional - comment out if you want to keep them)
+                # stl_path.unlink()
     
     # Write CSV file
     print(f"\n{'='*60}")
@@ -246,6 +259,7 @@ def main():
             'wall_thickness_mm',
             'porosity_min',
             'porosity_max',
+            'stl_path',  # STL file path
             'compressive_strength_MPa',
             'max_force_N',
             'cross_sectional_area_m2',
