@@ -1,3 +1,14 @@
+'''
+Iterate through parameter combinations (unit_cell_size, wall_thickness, porosity_min, porosity_max)
+Generate STL files using active_gyroid_gen.py for each combination
+Test each STL using mazers_model_active.py (FEM simulation)
+Log to dataset_full.csv:
+Input parameters (unit_cell_size_mm, wall_thickness_mm, porosity_min, porosity_max)
+STL path (stl_path)
+Results (compressive_strength_MPa, max_force_N, energy_absorption_J, etc.)
+Status (success/failed)
+The CSV now includes the STL path for each row. '''
+
 import os
 import sys
 import csv
