@@ -1,14 +1,3 @@
-'''
-Iterate through parameter combinations (unit_cell_size, wall_thickness, porosity_min, porosity_max)
-Generate STL files using active_gyroid_gen.py for each combination
-Test each STL using mazers_model_active.py (FEM simulation)
-Log to dataset_full.csv:
-Input parameters (unit_cell_size_mm, wall_thickness_mm, porosity_min, porosity_max)
-STL path (stl_path)
-Results (compressive_strength_MPa, max_force_N, energy_absorption_J, etc.)
-Status (success/failed)
-The CSV now includes the STL path for each row. '''
-
 import os
 import sys
 import csv
@@ -36,31 +25,31 @@ from mazers_model_active import (
 # Configuration - modify these to change the parameter sweep
 # Using active_gyroid_gen parameters
 
-# Unit cell sizes to test (mm) - minimal for simple test
-UNIT_CELL_SIZES = [3.0]  # mm
+# Unit cell sizes to test (mm) - comprehensive range
+UNIT_CELL_SIZES = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]  # mm
 
-# Wall thickness values to test (mm) - minimal for simple test
-WALL_THICKNESSES = [0.4]  # mm
+# Wall thickness values to test (mm) - comprehensive range
+WALL_THICKNESSES = [0.2, 0.3, 0.4, 0.5, 0.6]  # mm
 
-# Porosity ranges to test - minimal for simple test
-POROSITY_MIN_VALUES = [0.3]  # Minimum porosity
-POROSITY_MAX_VALUES = [0.6]  # Maximum porosity
+# Porosity ranges to test - comprehensive range
+POROSITY_MIN_VALUES = [0.2, 0.3, 0.4]  # Minimum porosity
+POROSITY_MAX_VALUES = [0.5, 0.6, 0.7, 0.8]  # Maximum porosity
 
-# Fixed parameters for all structures - computational settings reduced for testing
-NUMX = 3  # Number of unit cells in x (reduced from 5 for speed)
-NUMY = 3  # Number of unit cells in y (reduced from 5 for speed)
-NUMZ = 3  # Number of unit cells in z (reduced from 6 for speed)
-NSTEPS = 15  # Voxel resolution per unit cell (reduced from 30 for speed)
+# Fixed parameters for all structures - MINIMAL for speed
+NUMX = 1  # Number of unit cells in x (single cell)
+NUMY = 1  # Number of unit cells in y (single cell)
+NUMZ = 1  # Number of unit cells in z (single cell)
+NSTEPS = 8  # Voxel resolution per unit cell (very low)
 GRAD = 1  # Graded porosity (1) or constant (0)
 FUNC_DEGREE = 1  # Linear gradient
 DELTA = 0.2  # Porosity tolerance
 SMOOTHNESS = 0.8  # Gaussian smoothing
-MARCHING_STEP = 2  # Lower resolution marching cubes (2 = every other voxel, faster)
+MARCHING_STEP = 4  # Very low resolution marching cubes (fastest)
 
-# Simulation parameters - computational settings reduced for testing
-SIM_ELEMENT_SIZE = 0.08  # m (larger = faster, less accurate)
-SIM_MAX_FORCE = 10000000.0  # N (10 MN - reduced for faster testing)
-SIM_NUM_STEPS = 3  # Reduced steps for quick test
+# Simulation parameters - MINIMAL for speed
+SIM_ELEMENT_SIZE = 0.15  # m (very large = fastest)
+SIM_MAX_FORCE = 2000000.0  # N (2 MN - minimal)
+SIM_NUM_STEPS = 1  # Single step only
 
 # Output settings
 OUTPUT_CSV = 'dataset_full.csv'
