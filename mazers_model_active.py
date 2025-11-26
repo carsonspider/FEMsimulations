@@ -2,8 +2,7 @@
 """
 Simple FEM compression test simulation for STL files using linear elasticity.
 
-This script performs a uniaxial compression test using simple linear elastic
-material model (no damage, no plasticity) optimized for:
+This script performs a uniaxial compression test using Mazars damage model for cement:
 - Fast iterations and easy gradient computation
 - Topology optimization applications
 - Efficient parameter sweeps
