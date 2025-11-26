@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Simple FEM compression test simulation for STL files using linear elasticity.
+FEM compression test simulation for STL files using Mazars damage model.
 
-This script performs a uniaxial compression test using Mazars damage model for cement:
-- Fast iterations and easy gradient computation
-- Topology optimization applications
-- Efficient parameter sweeps
+This script performs a uniaxial compression test using the Mazars continuum
+damage mechanics model with:
+- Nonlinear damage evolution (compounding, irreversible)
+- Effective modulus reduction based on damage field
+- Newton-Raphson iterations for damage convergence
+- Localized microcracking (damage field)
+
+The Mazars model accounts for stiffness degradation under loading, making it
+suitable for simulating cement/concrete behavior (target: 10-20 MPa compressive strength).
 
 Outputs:
 - Compressive strength
-- Stress-strain curve
+- Stress-strain curve (nonlinear due to damage)
 - Displacement field visualization
 - Energy absorption
+- Damage field (microcracking)
 """
 
 import numpy as np
@@ -26,7 +32,7 @@ from petsc4py import PETSc
 import ufl
 from dolfinx import mesh, fem
 from dolfinx.fem import functionspace, Function, Constant, dirichletbc, locate_dofs_geometrical
-from dolfinx.fem.petsc import LinearProblem
+from dolfinx.fem.petsc import LinearProblem, NonlinearProblem
 from dolfinx.nls.petsc import NewtonSolver
 
 comm = MPI.COMM_WORLD
@@ -34,17 +40,20 @@ comm = MPI.COMM_WORLD
 
 @dataclass
 class MaterialProperties:
-    """Simple linear elastic material properties for concrete.
+    """Material properties for Mazars damage model (cement/concrete).
     
-    Optimized for fast iterations and easy gradient computation.
-    Typical values for concrete:
+    The Mazars model uses continuum damage mechanics to account for:
+    - Stiffness degradation under loading
+    - Irreversible damage accumulation
+    - Localized microcracking
+    
+    Typical values for cement (10-20 MPa compressive strength):
     - E: 20-30 GPa (Young's modulus)
     - nu: 0.15-0.2 (Poisson's ratio)
+    - epsilon_c0: 6e-4 (compressive damage threshold strain)
+    - A_c: 1.4 (compressive damage evolution parameter)
     
-    Linear elasticity ensures:
-    - Fast convergence (single linear solve per load step)
-    - Smooth gradients for topology optimization
-    - No damage/plasticity iterations needed
+    The effective modulus is reduced by damage: E_eff = E * (1 - damage)
     """
     
     E: float = 25e9  # Young's modulus (Pa) - 25 GPa (typical for concrete: 20-30 GPa)
@@ -66,11 +75,16 @@ class MaterialProperties:
 
 @dataclass
 class SimulationParameters:
-    """Simulation control parameters.
+    """Simulation control parameters for Mazars damage model.
     
-    Optimized defaults for fast testing:
+    Nonlinear solver settings:
+    - max_newton_iter: Maximum Newton-Raphson iterations per load step
+    - newton_tol: Convergence tolerance for Newton solver
+    - damage_tol: Damage field convergence tolerance
+    
+    Load control:
     - Fewer steps for quick iteration
-    - Forces sufficient to reach realistic compressive strengths (15-20 MPa)
+    - Forces sufficient to reach realistic compressive strengths (10-20 MPa)
     - Reasonable element size for balance between speed and accuracy
     
     Note: For typical 1 m² cross-section, 20 MN force ≈ 20 MPa stress
@@ -79,6 +93,9 @@ class SimulationParameters:
     max_force: float = 20000000.0  # N (20 MN default - sufficient for ~20 MPa stress on 1 m² area)
     num_steps: int = 5  # Reduced for fast testing
     element_size: float = 0.05  # m (balanced for speed/accuracy)
+    max_newton_iter: int = 10  # Maximum Newton-Raphson iterations per load step
+    newton_tol: float = 1e-6  # Newton solver tolerance
+    damage_tol: float = 1e-4  # Damage convergence tolerance
 
 
 def load_stl_and_create_mesh(stl_path: Path, element_size: float):
@@ -127,24 +144,35 @@ def mazars_compressive_damage(epsilon_eq: float, epsilon_c0: float, A_c: float) 
     return np.clip(dc, 0.0, 1.0)
 
 
+def compute_equivalent_strain(epsilon: np.ndarray) -> float:
+    """Compute equivalent strain for Mazars damage model (positive principal strains)."""
+    eigenvals = np.linalg.eigvals(epsilon)
+    positive_strains = eigenvals[eigenvals > 0]
+    if len(positive_strains) == 0:
+        return 0.0
+    return np.sqrt(np.sum(positive_strains**2))
+
+
 def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: SimulationParameters) -> Dict:
-    """Run uniaxial compression test using simple linear elasticity.
+    """Run uniaxial compression test with nonlinear Mazars damage model.
     
-    Linear elasticity ensures:
-    - Fast computation (single linear solve per step)
-    - Smooth, differentiable response for gradient-based optimization
-    - No damage/plasticity iterations required
-    - Ideal for topology optimization applications
+    Features:
+    - Nonlinear Newton-Raphson iterations for damage convergence
+    - Improved boundary conditions (lateral expansion allowed)
+    - Error checking (convergence, energy balance)
+    - Microcracking (localized damage field)
     """
     print("\n" + "="*60)
-    print("RUNNING COMPRESSION TEST (Simple Linear Elasticity)")
+    print("RUNNING COMPRESSION TEST (Nonlinear Mazars Damage Model)")
     print("="*60)
     
-    # Function space
+    # Function spaces
     V = functionspace(fenics_mesh, ("Lagrange", 1, (fenics_mesh.geometry.dim,)))
+    V_scalar = functionspace(fenics_mesh, ("Lagrange", 1))  # For damage field
     
-    damage_prev = 0.0
-    damage_history = []
+    # Initialize damage field for microcracking
+    damage_field = Function(V_scalar)
+    damage_field.x.array[:] = 0.0
     
     # Get mesh coordinates for boundary detection
     coords = fenics_mesh.geometry.x
@@ -158,16 +186,35 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
     # Calculate cross-sectional area
     cross_sectional_area = (x_max - x_min) * (y_max - y_min)
     
-    # Boundary conditions
+    # Improved boundary conditions
     def bottom_boundary(x):
         return np.isclose(x[2], z_min, atol=1e-6)
     
     def top_boundary(x):
         return np.isclose(x[2], z_max, atol=1e-6)
     
-    # Fixed bottom
+    # Bottom: fixed in z, allow lateral expansion (x, y free)
     bottom_dofs = locate_dofs_geometrical(V, bottom_boundary)
-    bc_bottom = dirichletbc(PETSc.ScalarType((0.0, 0.0, 0.0)), bottom_dofs, V)
+    bc_bottom_z = dirichletbc(PETSc.ScalarType(0.0), locate_dofs_geometrical(V.sub(2).collapse()[0], bottom_boundary), V.sub(2))
+    
+    # Prevent rigid body motion: fix one point in x and y at bottom
+    # Find a point near bottom center
+    bottom_coords = coords[coords[:, 2] < z_min + 1e-5]
+    if len(bottom_coords) > 0:
+        center_x = (x_min + x_max) / 2
+        center_y = (y_min + y_max) / 2
+        def bottom_center(x):
+            return np.isclose(x[2], z_min, atol=1e-6) & np.isclose(x[0], center_x, atol=(x_max-x_min)*0.1) & np.isclose(x[1], center_y, atol=(y_max-y_min)*0.1)
+        try:
+            bc_center_x = dirichletbc(PETSc.ScalarType(0.0), locate_dofs_geometrical(V.sub(0).collapse()[0], bottom_center), V.sub(0))
+            bc_center_y = dirichletbc(PETSc.ScalarType(0.0), locate_dofs_geometrical(V.sub(1).collapse()[0], bottom_center), V.sub(1))
+        except:
+            # Fallback: just fix bottom z, allow lateral expansion
+            bc_center_x = None
+            bc_center_y = None
+    else:
+        bc_center_x = None
+        bc_center_y = None
     
     # Force control
     force_max = sim_params.max_force
@@ -175,11 +222,17 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
     
     strains, stresses, energies, displacements, forces = [], [], [], [], []
     damage_history = []
+    convergence_info = []
     
-    print(f"Running {sim_params.num_steps} load steps...")
+    # Initialize previous solution for damage iteration
+    u_prev = Function(V)
+    u_prev.x.array[:] = 0.0
+    
+    print(f"Running {sim_params.num_steps} load steps with damage iterations...")
     print(f"Cross-sectional area: {cross_sectional_area:.6f} m²")
     print(f"Maximum force: {force_max/1e3:.2f} kN ({force_max:.0f} N)")
     print(f"Maximum traction: {force_max/cross_sectional_area/1e6:.2f} MPa")
+    print(f"Damage tolerance: {sim_params.damage_tol:.2e}, Max damage iterations: {sim_params.max_newton_iter}")
     
     # Load steps
     for step in range(sim_params.num_steps):
@@ -190,8 +243,12 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
         current_force = force_step * (step + 1)
         current_traction = current_force / cross_sectional_area
         
-        # Boundary conditions: fixed bottom, force on top
-        bcs = [bc_bottom]
+        # Boundary conditions: improved constraints
+        bcs = [bc_bottom_z]
+        if bc_center_x is not None:
+            bcs.append(bc_center_x)
+        if bc_center_y is not None:
+            bcs.append(bc_center_y)
         
         # Define traction vector (compression = negative z direction)
         traction_vector = Constant(fenics_mesh, PETSc.ScalarType((0.0, 0.0, -current_traction)))
@@ -199,49 +256,95 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
         # Create boundary measure
         ds = ufl.Measure("ds", domain=fenics_mesh)
         
-        # Simple linear elasticity with Mazars-style damage (scalar softening)
-        # Keep the solve linear by updating stiffness with the previous damage state
+        # Damage iteration loop: solve with current damage, then update damage, repeat until convergence
         u = Function(V)
-        v = ufl.TestFunction(V)
-        u_trial = ufl.TrialFunction(V)
+        if step > 0:
+            # Use previous step's solution as initial guess
+            u.x.array[:] = u_prev.x.array[:]
+        else:
+            u.x.array[:] = 0.0  # Initialize for first step
         
-        # Variational form: a(u,v) = L(v)
-        # Standard linear elasticity bilinear form
-        # a(u,v) = ∫ [λ tr(ε(u)) tr(ε(v)) + 2μ ε(u):ε(v)] dΩ
-        # This is linear in u, ensuring fast gradient computation
         def epsilon(w):
             """Compute symmetric strain tensor."""
             return ufl.sym(ufl.grad(w))
         
-        epsilon_u = epsilon(u_trial)
-        epsilon_v = epsilon(v)
+        # Damage iteration: iterate until damage converges
+        converged = False
+        damage_prev_iter = damage_field.x.array.copy()  # Damage at start of this load step
         
-        # Update material stiffness with prior damage
-        E_eff = material.E * (1.0 - damage_prev)
-        lmbda_eff = E_eff * material.nu / ((1.0 + material.nu) * (1.0 - 2.0 * material.nu))
-        mu_eff = E_eff / (2.0 * (1.0 + material.nu))
-
-        # Bilinear form: linear elasticity with degraded stiffness
-        a = (lmbda_eff * ufl.tr(epsilon_u) * ufl.tr(epsilon_v) + 
-             2.0 * mu_eff * ufl.inner(epsilon_u, epsilon_v)) * ufl.dx(domain=fenics_mesh)
+        for damage_iter in range(sim_params.max_newton_iter):
+            # Step 1: Update effective material properties with CURRENT damage estimate
+            E_eff = material.E * (1.0 - damage_field)
+            lmbda_eff = E_eff * material.nu / ((1.0 + material.nu) * (1.0 - 2.0 * material.nu))
+            mu_eff = E_eff / (2.0 * (1.0 + material.nu))
+            
+            # Step 2: Solve linear problem with current damage
+            v = ufl.TestFunction(V)
+            epsilon_u = epsilon(u)
+            sigma = lmbda_eff * ufl.tr(epsilon_u) * ufl.Identity(3) + 2.0 * mu_eff * epsilon_u
+            
+            # Linear form: a(u, v) = L(v)
+            a = ufl.inner(sigma, ufl.grad(v)) * ufl.dx(domain=fenics_mesh)
+            L = ufl.inner(traction_vector, v) * ds(domain=fenics_mesh)
+            
+            # Solve linear problem
+            problem = LinearProblem(a, L, bcs=bcs, petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
+            u = problem.solve()
+            
+            # Step 3: Calculate strain from solution
+            epsilon_result = epsilon(u)
+            epsilon_zz_local = epsilon_result[2, 2]
+            
+            # Project strain field to scalar function space for damage calculation
+            v_damage = ufl.TestFunction(V_scalar)
+            u_damage = ufl.TrialFunction(V_scalar)
+            
+            # L2 projection: (u_damage, v_damage) = (epsilon_zz, v_damage)
+            a_proj = ufl.inner(u_damage, v_damage) * ufl.dx(domain=fenics_mesh)
+            L_proj = ufl.inner(epsilon_zz_local, v_damage) * ufl.dx(domain=fenics_mesh)
+            
+            # Solve projection
+            strain_zz_proj = Function(V_scalar)
+            problem_proj = LinearProblem(a_proj, L_proj, petsc_options={"ksp_type": "preonly", "pc_type": "lu"})
+            strain_zz_proj = problem_proj.solve()
+            
+            # Step 4: Calculate NEW damage from strain
+            strain_vals = strain_zz_proj.x.array
+            damage_vals_new = np.array([mazars_compressive_damage(abs(eps), material.epsilon_c0, material.A_c) for eps in strain_vals])
+            
+            # Update damage field (ensure non-decreasing - irreversibility)
+            damage_vals_new = np.maximum(damage_vals_new, damage_field.x.array)  # Can't decrease
+            damage_vals_new = np.maximum(damage_vals_new, damage_prev_iter)  # Can't go below previous step
+            
+            # Step 5: Check damage convergence
+            damage_change = np.max(np.abs(damage_vals_new - damage_field.x.array))
+            damage_field.x.array[:] = damage_vals_new
+            
+            if damage_change < sim_params.damage_tol:
+                converged = True
+                if damage_iter > 0:
+                    print(f"      Damage converged in {damage_iter+1} iterations (change: {damage_change:.2e})")
+                break
         
-        # Linear form (right-hand side - traction)
-        # External work from applied traction
-        L = ufl.inner(traction_vector, v) * ds(domain=fenics_mesh)
+        # Store solution for next step
+        u_prev = Function(V)
+        u_prev.x.array[:] = u.x.array[:]
         
-        # Solve linear system - optimized for speed
-        # Using direct solver (LU) for fast, reliable convergence
-        # No iterations needed - single linear solve per load step
-        problem = LinearProblem(a, L, bcs=bcs, petsc_options={
-            "ksp_type": "preonly",  # Direct solve, no iterations
-            "pc_type": "lu",         # LU factorization for speed
-            "ksp_rtol": 1e-10,       # Tight tolerance (direct solve)
-        })
-        u = problem.solve()
-        
-        # Recompute strain and stress for results (using solved u)
+        # Recompute final stress and strain with converged damage
         epsilon_result = epsilon(u)
-        sigma = lmbda_eff * ufl.tr(epsilon_result) * ufl.Identity(3) + 2.0 * mu_eff * epsilon_result
+        E_eff_final = material.E * (1.0 - damage_field)
+        lmbda_eff_final = E_eff_final * material.nu / ((1.0 + material.nu) * (1.0 - 2.0 * material.nu))
+        mu_eff_final = E_eff_final / (2.0 * (1.0 + material.nu))
+        sigma = lmbda_eff_final * ufl.tr(epsilon_result) * ufl.Identity(3) + 2.0 * mu_eff_final * epsilon_result
+        
+        # Error checking: Energy balance and convergence
+        # Internal energy (strain energy)
+        internal_energy = fem.assemble_scalar(fem.form(0.5 * ufl.inner(sigma, epsilon_result) * ufl.dx(domain=fenics_mesh)))
+        # External work (work done by traction on boundary)
+        external_work = fem.assemble_scalar(fem.form(ufl.inner(traction_vector, u) * ds(domain=fenics_mesh)))
+        # Energy error - use absolute values for compression (work is negative)
+        total_energy = max(abs(internal_energy), abs(external_work), 1.0)
+        energy_error = abs(internal_energy - external_work) / total_energy
         
         # Compute results
         strain_zz = epsilon_result[2, 2]
@@ -249,7 +352,11 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
         
         strain_avg = fem.assemble_scalar(fem.form(strain_zz * ufl.dx(domain=fenics_mesh))) / fem.assemble_scalar(fem.form(Constant(fenics_mesh, PETSc.ScalarType(1.0)) * ufl.dx(domain=fenics_mesh)))
         stress_avg = fem.assemble_scalar(fem.form(stress_zz * ufl.dx(domain=fenics_mesh))) / fem.assemble_scalar(fem.form(Constant(fenics_mesh, PETSc.ScalarType(1.0)) * ufl.dx(domain=fenics_mesh)))
-        energy = fem.assemble_scalar(fem.form(0.5 * ufl.inner(sigma, epsilon_result) * ufl.dx(domain=fenics_mesh)))
+        energy = internal_energy
+        
+        # Average damage
+        damage_avg = fem.assemble_scalar(fem.form(damage_field * ufl.dx(domain=fenics_mesh))) / fem.assemble_scalar(fem.form(Constant(fenics_mesh, PETSc.ScalarType(1.0)) * ufl.dx(domain=fenics_mesh)))
+        damage_max = np.max(damage_field.x.array)
         
         # Get displacement at top surface
         top_dofs_z = locate_dofs_geometrical(V.sub(2).collapse()[0], top_boundary)
@@ -267,16 +374,22 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
         energies.append(float(energy))
         displacements.append(float(u_disp_avg))
         forces.append(float(force_N))
-
-        damage_prev = max(damage_prev,
-                          mazars_compressive_damage(abs(strain_avg), material.epsilon_c0, material.A_c))
-        damage_history.append(float(damage_prev))
+        damage_history.append(float(damage_avg))
+        convergence_info.append({
+            "damage_iterations": damage_iter + 1,
+            "converged": converged,
+            "energy_error": float(energy_error),
+            "damage_max": float(damage_max)
+        })
         
         if step % max(1, sim_params.num_steps // 5) == 0 or step == sim_params.num_steps - 1:
+            status = "✓" if converged else "⚠"
             print(f"    Step {step+1}/{sim_params.num_steps}: "
                   f"applied_force={force_N/1e3:.2f} kN, strain={strain_avg:.6f}, "
                   f"stress={stress_avg/1e6:.2f} MPa, displacement={u_disp_avg*1000:.3f} mm, "
-                  f"energy={energy:.2f} J, damage={damage_prev:.3f}")
+                  f"energy={energy:.2f} J, damage={damage_avg:.3f} (max={damage_max:.3f}) {status}")
+            if energy_error > 0.01:
+                print(f"      ⚠ Energy balance error: {energy_error*100:.2f}%")
     
     # Compressive strength is the maximum stress reached
     compressive_strength = max([abs(s) for s in stresses]) if stresses else 0.0
@@ -294,6 +407,8 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
         "displacements": displacements,
         "energies": energies,
         "damage_history": damage_history,
+        "damage_field": damage_field,  # Microcracking field
+        "convergence_info": convergence_info,
         "compressive_strength": compressive_strength,
         "max_force_N": max_force,
         "cross_sectional_area_m2": cross_sectional_area,
@@ -317,7 +432,7 @@ def plot_results(results: Dict, output_dir: Path):
     ax.plot(strains, stresses, "b-", linewidth=2, marker="o", markersize=4, label="Compression")
     ax.set_xlabel("Strain", fontsize=12, fontweight='bold')
     ax.set_ylabel("Stress (MPa)", fontsize=12, fontweight='bold')
-    ax.set_title("Compression Stress-Strain Curve (Linear Elastic)", fontsize=14, fontweight='bold')
+    ax.set_title("Compression Stress-Strain Curve (Mazars Damage Model)", fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend()
     
@@ -495,7 +610,7 @@ def main():
     """Main simulation function."""
     import argparse
     
-    parser = argparse.ArgumentParser(description="Simple FEM compression test simulation (no damage model)")
+    parser = argparse.ArgumentParser(description="FEM compression test simulation with Mazars damage model")
     parser.add_argument("stl_file", type=str, help="Path to input STL file")
     parser.add_argument("--output-dir", type=str, default="compression_results", help="Output directory")
     parser.add_argument("--element-size", type=float, default=0.05, help="Mesh element size (m) - larger = faster but less accurate")
@@ -512,20 +627,22 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("\n" + "="*60)
-    print("SIMPLE FEM COMPRESSION TEST (Linear Elasticity)")
-    print("Optimized for fast testing and topology optimization")
+    print("FEM COMPRESSION TEST (Mazars Damage Model)")
+    print("Nonlinear damage evolution with stiffness degradation")
     print("="*60)
     print(f"STL file: {stl_path}")
     print(f"Element size: {args.element_size} m")
     print(f"Number of steps: {args.num_steps}")
     print(f"Max force: {args.max_force/1e3:.2f} kN ({args.max_force:.0f} N)")
-    print(f"\nMaterial Properties (Linear Elastic):")
-    print(f"  Young's modulus: {MaterialProperties().E/1e9:.1f} GPa")
-    print(f"  Poisson's ratio: {MaterialProperties().nu:.2f}")
+    print(f"\nMaterial Properties (Mazars Damage Model):")
+    material = MaterialProperties()
+    print(f"  Young's modulus: {material.E/1e9:.1f} GPa")
+    print(f"  Poisson's ratio: {material.nu:.2f}")
+    print(f"  Damage threshold strain (epsilon_c0): {material.epsilon_c0:.2e}")
+    print(f"  Damage evolution parameter (A_c): {material.A_c:.2f}")
     print("="*60 + "\n")
     
-    # Material properties - linear elastic, optimized for fast computation
-    material = MaterialProperties()
+    # Material properties - Mazars damage model
     sim_params = SimulationParameters(
         element_size=args.element_size,
         max_force=args.max_force,
