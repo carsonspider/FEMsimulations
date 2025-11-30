@@ -493,12 +493,13 @@ def visualise(
     plt.show()
 
 
-def create_gyroid(params: GyroidParameters, output_dir: Path) -> Path:
-    """Generate, export, and visualise a gyroid lattice."""
+def create_gyroid(params: GyroidParameters, output_dir: Path, show_plot: bool = True) -> Path:
+    """Generate, export, and optionally visualise a gyroid lattice."""
     volume, spacing, metadata = generate_volume(params)
     verts, faces, *_ = marching_cubes_mesh(volume, spacing, params)
     stl_path = export_stl(verts, faces, output_dir)
-    visualise(params, volume, verts, faces, spacing, metadata)
+    if show_plot:
+        visualise(params, volume, verts, faces, spacing, metadata)
     return stl_path
 
 
