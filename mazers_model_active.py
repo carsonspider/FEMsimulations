@@ -91,7 +91,7 @@ class SimulationParameters:
     """
     
     max_force: float = 20000000.0  # N (20 MN default - sufficient for ~20 MPa stress on 1 m² area)
-    num_steps: int = 5  # Reduced for fast testing
+    num_steps: int = 10  # Full simulation with 10 steps
     element_size: float = 0.05  # m (balanced for speed/accuracy)
     max_newton_iter: int = 10  # Maximum Newton-Raphson iterations per load step
     newton_tol: float = 1e-6  # Newton solver tolerance
@@ -279,12 +279,15 @@ def run_compression_test(fenics_mesh, material: MaterialProperties, sim_params: 
             mu_eff = E_eff / (2.0 * (1.0 + material.nu))
             
             # Step 2: Solve linear problem with current damage
+            # Use TrialFunction for unknown displacement
+            u_trial = ufl.TrialFunction(V)
             v = ufl.TestFunction(V)
-            epsilon_u = epsilon(u)
+            epsilon_u = epsilon(u_trial)
+            epsilon_v = epsilon(v)  # Symmetric gradient of test function
             sigma = lmbda_eff * ufl.tr(epsilon_u) * ufl.Identity(3) + 2.0 * mu_eff * epsilon_u
             
-            # Linear form: a(u, v) = L(v)
-            a = ufl.inner(sigma, ufl.grad(v)) * ufl.dx(domain=fenics_mesh)
+            # Bilinear form: a(u, v) = inner(sigma(u), epsilon(v))
+            a = ufl.inner(sigma, epsilon_v) * ufl.dx(domain=fenics_mesh)
             L = ufl.inner(traction_vector, v) * ds(domain=fenics_mesh)
             
             # Solve linear problem
@@ -615,7 +618,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="compression_results", help="Output directory")
     parser.add_argument("--element-size", type=float, default=0.05, help="Mesh element size (m) - larger = faster but less accurate")
     parser.add_argument("--max-force", type=float, default=20000000.0, help="Maximum force to apply (N) - default 20 MN for realistic stress levels (~20 MPa on 1 m²)")
-    parser.add_argument("--num-steps", type=int, default=5, help="Number of load steps - default 5 for fast testing")
+    parser.add_argument("--num-steps", type=int, default=10, help="Number of load steps - default 10 for full simulations")
     
     args = parser.parse_args()
     
