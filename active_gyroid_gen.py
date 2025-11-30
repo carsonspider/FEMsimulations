@@ -496,8 +496,60 @@ def visualise(
 def create_gyroid(params: GyroidParameters, output_dir: Path, show_plot: bool = True) -> Path:
     """Generate, export, and optionally visualise a gyroid lattice."""
     volume, spacing, metadata = generate_volume(params)
+    
+    # Validate volume has some solid material
+    solid_voxels = np.sum(volume)
+    total_voxels = volume.size
+    solid_fraction = solid_voxels / total_voxels if total_voxels > 0 else 0.0
+    
+    if solid_voxels == 0:
+        raise ValueError(
+            f"Generated volume is empty! Check parameters:\n"
+            f"  - porosity_min={params.porosity_min}, porosity_max={params.porosity_max}\n"
+            f"  - nsteps={params.nsteps} (try increasing to 15-20)\n"
+            f"  - unit_cell_size={params.unit_cell_size}mm (try increasing)\n"
+            f"  - wall_thickness={params.wall_thickness}mm (try increasing)"
+        )
+    
+    if solid_fraction < 0.01:  # Less than 1% solid is too sparse
+        raise ValueError(
+            f"Volume is too sparse (only {solid_fraction*100:.1f}% solid)! "
+            f"Try reducing porosity (current: {params.porosity_min}-{params.porosity_max}) "
+            f"or increasing nsteps (current: {params.nsteps})"
+        )
+    
     verts, faces, *_ = marching_cubes_mesh(volume, spacing, params)
+    
+    # Validate mesh has faces
+    if len(faces) == 0:
+        raise ValueError(
+            f"Marching cubes produced no faces! Volume might be too sparse.\n"
+            f"  - Solid fraction: {solid_fraction*100:.1f}%\n"
+            f"  - Try: reducing porosity, increasing nsteps (current: {params.nsteps}), "
+            f"or reducing marching_step (current: {params.marching_step})"
+        )
+    
+    if len(faces) < 100:  # Very few faces might indicate a problem
+        print(f"Warning: Mesh has only {len(faces)} faces, which is quite low. Consider increasing nsteps or reducing marching_step.")
+    
     stl_path = export_stl(verts, faces, output_dir)
+    
+    # Validate STL file was created and has reasonable size
+    if not stl_path.exists():
+        raise FileNotFoundError(f"STL file was not created at {stl_path}")
+    
+    file_size = stl_path.stat().st_size
+    if file_size < 5000:  # Less than 5KB is suspicious for a valid mesh
+        raise ValueError(
+            f"STL file is too small ({file_size} bytes, {file_size/1024:.1f} KB)! "
+            f"Mesh generation likely failed.\n"
+            f"  - Number of faces: {len(faces)}\n"
+            f"  - Solid fraction: {solid_fraction*100:.1f}%\n"
+            f"  - Try: increasing nsteps (current: {params.nsteps}), "
+            f"reducing marching_step (current: {params.marching_step}), "
+            f"or reducing porosity"
+        )
+    
     if show_plot:
         visualise(params, volume, verts, faces, spacing, metadata)
     return stl_path
