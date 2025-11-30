@@ -99,7 +99,10 @@ class SimulationParameters:
 
 
 def load_stl_and_create_mesh(stl_path: Path, element_size: float):
-    """Load STL file and create tetrahedral volume mesh."""
+    """Load STL file and create tetrahedral volume mesh.
+    
+    Note: element_size is in meters. If STL is in mm, it will be auto-detected.
+    """
     print(f"Loading STL file: {stl_path}")
     
     import meshio
@@ -114,17 +117,48 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         bbox_max = np.array([1.0, 1.0, 1.0], dtype=np.float64)
     
     size = bbox_max - bbox_min
+    max_dim = np.max(size)
+    
+    # Auto-detect units: if max dimension > 10, assume mm and convert to m
+    if max_dim > 10.0:
+        print(f"Detected STL in millimeters (max dimension: {max_dim:.2f} mm)")
+        print(f"Converting to meters for simulation...")
+        bbox_min = bbox_min / 1000.0  # Convert mm to m
+        bbox_max = bbox_max / 1000.0  # Convert mm to m
+        size = bbox_max - bbox_min
+        max_dim = np.max(size)
+        print(f"Converted bounding box: {bbox_min} to {bbox_max} (m)")
+    else:
+        print(f"STL appears to be in meters (max dimension: {max_dim:.2f} m)")
+    
+    # Calculate number of divisions
     n_x = max(2, int(size[0] / element_size))
     n_y = max(2, int(size[1] / element_size))
     n_z = max(2, int(size[2] / element_size))
     
-    print(f"Creating box mesh: {n_x}x{n_y}x{n_z} divisions")
-    print(f"Bounding box: {bbox_min} to {bbox_max}")
+    total_elements = n_x * n_y * n_z
+    print(f"Creating box mesh: {n_x}x{n_y}x{n_z} divisions ({total_elements:,} elements)")
+    print(f"Bounding box: {bbox_min} to {bbox_max} (m)")
     
+    # Safety check: warn if mesh is too large
+    if total_elements > 1000000:  # More than 1M elements
+        print(f"⚠ WARNING: Mesh will have {total_elements:,} elements!")
+        print(f"  This may take a very long time. Consider increasing --element-size")
+        print(f"  Current element_size: {element_size} m")
+        print(f"  Suggested: {element_size * 2:.3f} m or larger")
+        response = input("Continue anyway? (y/n): ").strip().lower()
+        if response != 'y':
+            raise ValueError("Mesh creation cancelled by user")
+    
+    # Ensure coordinates are numpy arrays with correct dtype
+    bbox_min = np.array(bbox_min, dtype=np.float64)
+    bbox_max = np.array(bbox_max, dtype=np.float64)
+    
+    # create_box expects n as a tuple of integers, not a list
     fenics_mesh = mesh.create_box(
         comm,
-        [bbox_min, bbox_max],
-        [n_x, n_y, n_z],
+        [bbox_min.tolist(), bbox_max.tolist()],
+        (n_x, n_y, n_z),  # Tuple instead of list
         mesh.CellType.tetrahedron
     )
     
