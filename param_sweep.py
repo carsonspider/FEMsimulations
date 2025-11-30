@@ -4,16 +4,19 @@ import csv
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+# Set matplotlib to non-interactive backend before importing (prevents plot windows)
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+
 import numpy as np
 
 # Import gyroid generation functions
 from active_gyroid_gen import (
-    fn_plot_tpms_eq,
-    fn_check_face_normals,
-    fn_generate_mesh,
-    fn_export_stl_file
+    GyroidParameters,
+    validate_params,
+    create_gyroid
 )
-import trimesh
 
 # Import simulation functions from mazers_model_active
 from mazers_model_active import (
@@ -66,59 +69,39 @@ def generate_gyroid_structure(unit_cell_size: float, wall_thickness: float,
                                output_stl_path: Path) -> Tuple[bool, Path]:
     """Generate gyroid STL file with given parameters using active_gyroid_gen."""
     try:
-        # TPMS parameters
-        tpms_type = 'Shell'
-        tpms_design = 'Shell-TPMS Gyroid'
-        
-        # Calculate sizes based on unit cell size and number of cells
-        sizes = [
-            NUMX * unit_cell_size,
-            NUMY * unit_cell_size,
-            NUMZ * unit_cell_size
-        ]
-        cell_sizes = [unit_cell_size, unit_cell_size, unit_cell_size]
-        origin = [0.0, 0.0, 0.0]
-        
-        # Convert wall thickness to thickness parameter (0-1 range)
-        # wall_thickness is in mm, we need to normalize it
-        thickness = wall_thickness / unit_cell_size  # Normalize by unit cell size
-        thickness = min(max(thickness, 0.1), 0.8)  # Clamp to reasonable range
-        
-        # Threshold parameter c controls porosity
-        # For porosity range [porosity_min, porosity_max], we use average
-        porosity_avg = (porosity_min + porosity_max) / 2.0
-        c = 1.0 - 2.0 * porosity_avg  # Convert porosity to threshold
-        
-        # Initial empty mesh
-        mesh = trimesh.Trimesh()
-        
         print(f"Generating gyroid: cell_size={unit_cell_size}mm, wall={wall_thickness}mm, "
               f"porosity=[{porosity_min:.2f}, {porosity_max:.2f}]")
         
-        # Step 1: Plot TPMS equation (generates initial mesh)
-        mesh, vertices = fn_plot_tpms_eq(
-            tpms_type, tpms_design, sizes, cell_sizes, origin,
-            NSTEPS, c, thickness, mesh, show_plot=False
+        # Create GyroidParameters using the new API
+        params = GyroidParameters(
+            numx=NUMX,
+            numy=NUMY,
+            numz=NUMZ,
+            unit_cell_size=unit_cell_size,
+            nsteps=NSTEPS,
+            porosity_min=porosity_min,
+            porosity_max=porosity_max,
+            grad=GRAD,
+            func_degree=FUNC_DEGREE,
+            delta=DELTA,
+            smoothness=SMOOTHNESS,
+            marching_step=MARCHING_STEP,
+            wall_thickness=wall_thickness
         )
         
-        # Step 2: Check face normals (skip visualization)
-        mesh = fn_check_face_normals(mesh, silent=True, show_plot=False)
+        # Validate parameters
+        params = validate_params(params)
         
-        # Step 3: Generate final mesh
-        final_mesh = fn_generate_mesh(
-            tpms_type, tpms_design, c, thickness, sizes, cell_sizes,
-            origin, NSTEPS, mesh, flip_face_normals=False, silent=True
-        )
-        
-        # Step 4: Export STL
-        stl_filename = output_stl_path.stem
+        # Generate gyroid and create STL using the new API (disable visualization for batch processing)
         stl_dir = output_stl_path.parent
-        fn_export_stl_file(final_mesh, stl_filename, str(stl_dir), silent=True)
+        stl_path = create_gyroid(params, stl_dir, show_plot=False)
         
-        stl_path = stl_dir / f"{stl_filename}.stl"
-        
-        print(f"✓ Generated STL: {stl_path.name}")
-        return True, stl_path
+        if stl_path.exists():
+            print(f"✓ Generated STL: {stl_path.name}")
+            return True, stl_path
+        else:
+            print(f"✗ STL file not created at {stl_path}")
+            return False, output_stl_path
             
     except Exception as e:
         print(f"✗ Error generating gyroid: {e}")
@@ -204,7 +187,7 @@ def main():
                     
                     # Create unique filename for this combination
                     stl_filename_base = f"gyroid_cs{unit_cell_size:.1f}_wt{wall_thickness:.2f}_p{porosity_min:.2f}_{porosity_max:.2f}"
-                    stl_path = TEMP_DIR / f"{stl_filename_base}.stl"
+                    stl_path = GYROID_OUTPUT_DIR / f"{stl_filename_base}.stl"
                     
                     # Generate gyroid structure using active_gyroid_gen
                     success, actual_stl_path = generate_gyroid_structure(
