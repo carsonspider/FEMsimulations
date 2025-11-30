@@ -8,10 +8,12 @@ import numpy as np
 
 # Import gyroid generation functions
 from active_gyroid_gen import (
-    GyroidParameters,
-    create_gyroid,
-    validate_params
+    fn_plot_tpms_eq,
+    fn_check_face_normals,
+    fn_generate_mesh,
+    fn_export_stl_file
 )
+import trimesh
 
 # Import simulation functions from mazers_model_active
 from mazers_model_active import (
@@ -25,31 +27,31 @@ from mazers_model_active import (
 # Configuration - modify these to change the parameter sweep
 # Using active_gyroid_gen parameters
 
-# Unit cell sizes to test (mm) - comprehensive range
+# Unit cell sizes to test (mm) - comprehensive range for full dataset
 UNIT_CELL_SIZES = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]  # mm
 
-# Wall thickness values to test (mm) - comprehensive range
+# Wall thickness values to test (mm) - comprehensive range for full dataset
 WALL_THICKNESSES = [0.2, 0.3, 0.4, 0.5, 0.6]  # mm
 
-# Porosity ranges to test - comprehensive range
+# Porosity ranges to test - comprehensive range for full dataset
 POROSITY_MIN_VALUES = [0.2, 0.3, 0.4]  # Minimum porosity
 POROSITY_MAX_VALUES = [0.5, 0.6, 0.7, 0.8]  # Maximum porosity
 
-# Fixed parameters for all structures - MINIMAL for speed
+# Fixed parameters for all structures - balanced for quality and speed
 NUMX = 1  # Number of unit cells in x (single cell)
 NUMY = 1  # Number of unit cells in y (single cell)
 NUMZ = 1  # Number of unit cells in z (single cell)
-NSTEPS = 8  # Voxel resolution per unit cell (very low)
+NSTEPS = 20  # Voxel resolution per unit cell (balanced quality/speed)
 GRAD = 1  # Graded porosity (1) or constant (0)
 FUNC_DEGREE = 1  # Linear gradient
 DELTA = 0.2  # Porosity tolerance
 SMOOTHNESS = 0.8  # Gaussian smoothing
-MARCHING_STEP = 4  # Very low resolution marching cubes (fastest)
+MARCHING_STEP = 2  # Marching cubes resolution (balanced quality/speed)
 
-# Simulation parameters - MINIMAL for speed
-SIM_ELEMENT_SIZE = 0.15  # m (very large = fastest)
-SIM_MAX_FORCE = 2000000.0  # N (2 MN - minimal)
-SIM_NUM_STEPS = 1  # Single step only
+# Simulation parameters - FULL simulations
+SIM_ELEMENT_SIZE = 0.05  # m (balanced for accuracy)
+SIM_MAX_FORCE = 20000000.0  # N (20 MN - realistic stress levels)
+SIM_NUM_STEPS = 10  # Full simulation with 10 steps
 
 # Output settings
 OUTPUT_CSV = 'dataset_full.csv'
@@ -62,32 +64,58 @@ GYROID_OUTPUT_DIR.mkdir(exist_ok=True)
 def generate_gyroid_structure(unit_cell_size: float, wall_thickness: float, 
                                porosity_min: float, porosity_max: float, 
                                output_stl_path: Path) -> Tuple[bool, Path]:
-    """Generate gyroid STL file with given parameters."""
+    """Generate gyroid STL file with given parameters using active_gyroid_gen."""
     try:
-        # Create gyroid parameters
-        params = GyroidParameters(
-            numx=NUMX,
-            numy=NUMY,
-            numz=NUMZ,
-            unit_cell_size=unit_cell_size,
-            nsteps=NSTEPS,
-            porosity_min=porosity_min,
-            porosity_max=porosity_max,
-            grad=GRAD,
-            func_degree=FUNC_DEGREE,
-            delta=DELTA,
-            smoothness=SMOOTHNESS,
-            marching_step=MARCHING_STEP,
-            wall_thickness=wall_thickness
-        )
+        # TPMS parameters
+        tpms_type = 'Shell'
+        tpms_design = 'Shell-TPMS Gyroid'
         
-        # Validate parameters
-        params = validate_params(params)
+        # Calculate sizes based on unit cell size and number of cells
+        sizes = [
+            NUMX * unit_cell_size,
+            NUMY * unit_cell_size,
+            NUMZ * unit_cell_size
+        ]
+        cell_sizes = [unit_cell_size, unit_cell_size, unit_cell_size]
+        origin = [0.0, 0.0, 0.0]
         
-        # Generate gyroid and create STL
+        # Convert wall thickness to thickness parameter (0-1 range)
+        # wall_thickness is in mm, we need to normalize it
+        thickness = wall_thickness / unit_cell_size  # Normalize by unit cell size
+        thickness = min(max(thickness, 0.1), 0.8)  # Clamp to reasonable range
+        
+        # Threshold parameter c controls porosity
+        # For porosity range [porosity_min, porosity_max], we use average
+        porosity_avg = (porosity_min + porosity_max) / 2.0
+        c = 1.0 - 2.0 * porosity_avg  # Convert porosity to threshold
+        
+        # Initial empty mesh
+        mesh = trimesh.Trimesh()
+        
         print(f"Generating gyroid: cell_size={unit_cell_size}mm, wall={wall_thickness}mm, "
               f"porosity=[{porosity_min:.2f}, {porosity_max:.2f}]")
-        stl_path = create_gyroid(params, GYROID_OUTPUT_DIR)
+        
+        # Step 1: Plot TPMS equation (generates initial mesh)
+        mesh, vertices = fn_plot_tpms_eq(
+            tpms_type, tpms_design, sizes, cell_sizes, origin,
+            NSTEPS, c, thickness, mesh, show_plot=False
+        )
+        
+        # Step 2: Check face normals (skip visualization)
+        mesh = fn_check_face_normals(mesh, silent=True, show_plot=False)
+        
+        # Step 3: Generate final mesh
+        final_mesh = fn_generate_mesh(
+            tpms_type, tpms_design, c, thickness, sizes, cell_sizes,
+            origin, NSTEPS, mesh, flip_face_normals=False, silent=True
+        )
+        
+        # Step 4: Export STL
+        stl_filename = output_stl_path.stem
+        stl_dir = output_stl_path.parent
+        fn_export_stl_file(final_mesh, stl_filename, str(stl_dir), silent=True)
+        
+        stl_path = stl_dir / f"{stl_filename}.stl"
         
         print(f"✓ Generated STL: {stl_path.name}")
         return True, stl_path
@@ -142,8 +170,8 @@ def extract_results_summary(results: Dict) -> Dict:
 
 def main():
     print("\n" + "="*60)
-    print("GYROID PARAMETER SWEEP - TEST MODE")
-    print("(All parameters kept, computational settings reduced)")
+    print("GYROID PARAMETER SWEEP - FULL SIMULATION MODE")
+    print("(10-step FEM simulations with Mazars damage model)")
     print("="*60)
     print(f"Unit cell sizes: {UNIT_CELL_SIZES} mm")
     print(f"Wall thicknesses: {WALL_THICKNESSES} mm")
@@ -151,7 +179,7 @@ def main():
     print(f"Porosity max values: {POROSITY_MAX_VALUES}")
     print(f"Mesh resolution: {NSTEPS} voxels/unit cell (reduced for speed)")
     print(f"Marching cubes step: {MARCHING_STEP} (lower = faster)")
-    print(f"Simulation steps: {SIM_NUM_STEPS} (reduced for speed)")
+    print(f"Simulation steps: {SIM_NUM_STEPS} (full simulation)")
     total_combinations = len(UNIT_CELL_SIZES) * len(WALL_THICKNESSES) * len(POROSITY_MIN_VALUES) * len(POROSITY_MAX_VALUES)
     print(f"Total combinations: {total_combinations}")
     print(f"Output CSV: {OUTPUT_CSV}")
@@ -178,75 +206,75 @@ def main():
                     stl_filename_base = f"gyroid_cs{unit_cell_size:.1f}_wt{wall_thickness:.2f}_p{porosity_min:.2f}_{porosity_max:.2f}"
                     stl_path = TEMP_DIR / f"{stl_filename_base}.stl"
                     
-                    # Generate gyroid structure
+                    # Generate gyroid structure using active_gyroid_gen
                     success, actual_stl_path = generate_gyroid_structure(
                         unit_cell_size, wall_thickness, porosity_min, porosity_max, stl_path
                     )
-                if not success:
-                    print(f"Skipping simulation due to generation failure")
-                    # Still record in CSV with error flag
-                    csv_rows.append({
+                    if not success:
+                        print(f"Skipping simulation due to generation failure")
+                        # Still record in CSV with error flag
+                        csv_rows.append({
                             'unit_cell_size_mm': unit_cell_size,
                             'wall_thickness_mm': wall_thickness,
                             'porosity_min': porosity_min,
                             'porosity_max': porosity_max,
                             'stl_path': None,
-                        'compressive_strength_MPa': None,
-                        'max_force_N': None,
-                        'cross_sectional_area_m2': None,
-                        'energy_absorption_J': None,
-                        'max_displacement_mm': None,
-                        'max_strain': None,
-                        'status': 'generation_failed',
-                    })
-                    continue
-            
-                # Use the actual path that was created
-                stl_path = actual_stl_path
-                
-                # Run simulation
-                results = run_simulation(stl_path)
-                
-                if results is None:
-                    print(f"⚠ Skipping CSV entry due to simulation failure")
-                    # Still record in CSV with error flag
-                    csv_rows.append({
+                            'compressive_strength_MPa': None,
+                            'max_force_N': None,
+                            'cross_sectional_area_m2': None,
+                            'energy_absorption_J': None,
+                            'max_displacement_mm': None,
+                            'max_strain': None,
+                            'status': 'generation_failed',
+                        })
+                        continue
+                    
+                    # Use the actual path that was created
+                    stl_path = actual_stl_path
+                    
+                    # Run simulation using mazers_model_active
+                    results = run_simulation(stl_path)
+                    
+                    if results is None:
+                        print(f"⚠ Skipping CSV entry due to simulation failure")
+                        # Still record in CSV with error flag
+                        csv_rows.append({
                             'unit_cell_size_mm': unit_cell_size,
                             'wall_thickness_mm': wall_thickness,
                             'porosity_min': porosity_min,
                             'porosity_max': porosity_max,
                             'stl_path': str(stl_path) if stl_path.exists() else None,
-                        'compressive_strength_MPa': None,
-                        'max_force_N': None,
-                        'cross_sectional_area_m2': None,
-                        'energy_absorption_J': None,
-                        'max_displacement_mm': None,
-                        'max_strain': None,
-                        'status': 'simulation_failed',
-                    })
-                    continue
-                
-                # Extract summary results
-                summary = extract_results_summary(results)
-                
-                # Add input parameters
-                row = {
+                            'compressive_strength_MPa': None,
+                            'max_force_N': None,
+                            'cross_sectional_area_m2': None,
+                            'energy_absorption_J': None,
+                            'max_displacement_mm': None,
+                            'max_strain': None,
+                            'status': 'simulation_failed',
+                        })
+                        continue
+                    
+                    # Extract summary results
+                    summary = extract_results_summary(results)
+                    
+                    # Add input parameters
+                    row = {
                         'unit_cell_size_mm': unit_cell_size,
                         'wall_thickness_mm': wall_thickness,
                         'porosity_min': porosity_min,
                         'porosity_max': porosity_max,
                         'stl_path': str(stl_path),  # STL file path
-                    **summary,
-                    'status': 'success',
-                }
-                
-                csv_rows.append(row)
-                
-                # Print summary
-                print(f"Results: Compressive strength = {summary['compressive_strength_MPa']:.2f} MPa")
-                
-                # Clean up STL file to save space (optional - comment out if you want to keep them)
-                # stl_path.unlink()
+                        **summary,
+                        'status': 'success',
+                    }
+                    
+                    csv_rows.append(row)
+                    
+                    # Print summary
+                    print(f"Results: Compressive strength = {summary['compressive_strength_MPa']:.2f} MPa")
+                    
+                    # Clean up STL file to save space (optional - comment out if you want to keep them)
+                    # stl_path.unlink()
     
     # Write CSV file
     print(f"\n{'='*60}")
