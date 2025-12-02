@@ -42,30 +42,36 @@ from stl import mesh
 @dataclass
 class GyroidParameters:
     """
-    Parameter bundle for the graded gyroid generator.
+    Parameter bundle for the graded TPMS generator.
     
-    This dataclass encapsulates all parameters needed to generate a gyroid
-    lattice structure following the methodology from the referenced paper.
+    This dataclass encapsulates all parameters needed to generate TPMS
+    (Triply Periodic Minimal Surface) lattice structures including:
+    - Gyroid (Schoen gyroid)
+    - Schwarz (Schwarz P-surface / Primitive)
+    - Diamond (Schwarz D-surface)
+    - Lidinoid
+    - Split-P
+    
     All geometric parameters are defined in physical units (millimetres)
     to ensure direct manufacturing compatibility.
     
     Attributes
     ----------
     numx : int
-        Number of gyroid unit cells repeated along the x-axis.
+        Number of unit cells repeated along the x-axis.
         Together with unit_cell_size, determines Lx (domain length in x).
     numy : int
-        Number of gyroid unit cells repeated along the y-axis.
+        Number of unit cells repeated along the y-axis.
         Together with unit_cell_size, determines Ly (domain length in y).
     numz : int
-        Number of gyroid unit cells repeated along the z-axis (build direction).
+        Number of unit cells repeated along the z-axis (build direction).
         Together with unit_cell_size, determines Lz (domain length in z).
         This is the direction of porosity grading.
     unit_cell_size : float
-        Physical dimension of a single gyroid unit cell in millimetres.
+        Physical dimension of a single unit cell in millimetres.
         The total domain size is: Lx = numx × unit_cell_size (and similarly for y, z).
     nsteps : int
-        Number of voxels used to discretize the gyroid in each direction
+        Number of voxels used to discretize the TPMS in each direction
         per unit cell. Higher values yield finer resolution but increase
         computation time and mesh complexity. Minimum: 4 (required for gradients).
     porosity_min : float
@@ -95,7 +101,7 @@ class GyroidParameters:
         computation time. Typical range: 0.01-0.05.
     smoothness : float
         Standard deviation (in voxels) for optional Gaussian smoothing
-        applied to the implicit gyroid field before thresholding. This
+        applied to the implicit TPMS field before thresholding. This
         reduces voxel-scale artifacts and stair-stepping. 0.0 = no smoothing.
         Typical range: 0.5-1.0 voxels.
     marching_step : int
@@ -105,9 +111,16 @@ class GyroidParameters:
         step_size=2 uses every other voxel (faster, lower resolution).
     wall_thickness : float, optional
         Thickness of the bounding box walls in millimetres. These solid walls
-        enclose the gyroid lattice on all 6 faces, making the structure
+        enclose the TPMS lattice on all 6 faces, making the structure
         watertight and suitable for simulation/printing. Default: 0.5 mm.
         Set to 0.0 to disable bounding box (not recommended for printing).
+    tpms_type : str, optional
+        Type of TPMS structure to generate. Options:
+        - 'gyroid': Schoen gyroid (default)
+        - 'schwarz': Schwarz P-surface / Primitive
+        - 'diamond': Schwarz D-surface / Diamond
+        - 'lidinoid': Lidinoid surface
+        - 'split-p': Split-P surface
     """
 
     numx: int
@@ -123,6 +136,7 @@ class GyroidParameters:
     smoothness: float  # Gaussian sigma (voxels)
     marching_step: int
     wall_thickness: float = 0.5  # wall thickness in mm for bounding box
+    tpms_type: str = 'gyroid'  # TPMS structure type
 
 
 # Default parameters reproduced from the experimental setup in Section 2.1
@@ -191,6 +205,13 @@ def validate_params(params: GyroidParameters) -> GyroidParameters:
     if params.grad not in (0, 1):
         raise ValueError("grad must be 0 (constant porosity) or 1 (graded porosity).")
     
+    # Validate TPMS type if present
+    if hasattr(params, 'tpms_type'):
+        valid_types = ['gyroid', 'schwarz', 'diamond', 'lidinoid', 'split-p']
+        if params.tpms_type.lower() not in valid_types:
+            print(f"Warning: Unknown TPMS type '{params.tpms_type}', defaulting to 'gyroid'")
+            params.tpms_type = 'gyroid'
+    
     # Clamp porosity values to valid range [0, 1]
     poro_min = float(np.clip(params.porosity_min, 0.0, 1.0))
     poro_max = float(np.clip(params.porosity_max, 0.0, 1.0))
@@ -198,6 +219,14 @@ def validate_params(params: GyroidParameters) -> GyroidParameters:
     # Ensure porosity_min <= porosity_max (swap if necessary)
     if poro_min > poro_max:
         poro_min, poro_max = poro_max, poro_min
+    
+    # Get TPMS type if present, default to 'gyroid'
+    tpms_type = 'gyroid'
+    if hasattr(params, 'tpms_type'):
+        tpms_type = params.tpms_type.lower()
+        valid_types = ['gyroid', 'schwarz', 'diamond', 'lidinoid', 'split-p']
+        if tpms_type not in valid_types:
+            tpms_type = 'gyroid'
     
     # Return validated parameter bundle with type coercion and clamping
     return GyroidParameters(
@@ -214,6 +243,7 @@ def validate_params(params: GyroidParameters) -> GyroidParameters:
         smoothness=float(max(params.smoothness, 0.0)),  # Non-negative smoothing
         marching_step=int(max(params.marching_step, 1)),  # Minimum step_size=1
         wall_thickness=float(max(params.wall_thickness, 0.0)),  # Non-negative walls
+        tpms_type=tpms_type,                        # TPMS structure type
     )
 
 
@@ -265,8 +295,24 @@ def generate_coordinate_grid(params: GyroidParameters) -> Tuple[np.ndarray, np.n
     return np.meshgrid(x, y, z, indexing="ij")
 
 
-def gyroid_field(params: GyroidParameters, grid: Tuple[np.ndarray, np.ndarray, np.ndarray]) -> np.ndarray:
-    """Evaluate the implicit gyroid field (normalised to [-1, 1])."""
+def tpms_field(params: GyroidParameters, grid: Tuple[np.ndarray, np.ndarray, np.ndarray]) -> np.ndarray:
+    """
+    Evaluate the implicit TPMS field (normalised to [-1, 1]).
+    
+    Supports multiple TPMS lattice types: gyroid, schwarz, diamond, lidinoid, split-p.
+    
+    Parameters
+    ----------
+    params : GyroidParameters
+        Parameters including tpms_type
+    grid : Tuple[np.ndarray, np.ndarray, np.ndarray]
+        Coordinate grids (x, y, z)
+    
+    Returns
+    -------
+    np.ndarray
+        Normalized TPMS field values in [-1, 1]
+    """
     x, y, z = grid
     lx, ly, lz = compute_domain_lengths(params)
 
@@ -274,12 +320,72 @@ def gyroid_field(params: GyroidParameters, grid: Tuple[np.ndarray, np.ndarray, n
     ky = 2.0 * np.pi / ly
     kz = 2.0 * np.pi / lz
 
-    field = (
-        np.sin(kx * x) * np.cos(ky * y)
-        + np.sin(ky * y) * np.cos(kz * z)
-        + np.sin(kz * z) * np.cos(kx * x)
-    ) / 3.0
+    # Get TPMS type (case-insensitive, default to gyroid)
+    tpms_type = params.tpms_type.lower() if hasattr(params, 'tpms_type') else 'gyroid'
+    
+    if tpms_type == 'gyroid':
+        # Schoen gyroid equation
+        field = (
+            np.sin(kx * x) * np.cos(ky * y)
+            + np.sin(ky * y) * np.cos(kz * z)
+            + np.sin(kz * z) * np.cos(kx * x)
+        ) / 3.0
+        
+    elif tpms_type == 'schwarz':
+        # Schwarz P-surface (Primitive)
+        field = (
+            np.cos(kx * x) + np.cos(ky * y) + np.cos(kz * z)
+        ) / 3.0
+        
+    elif tpms_type == 'diamond':
+        # Schwarz D-surface (Diamond)
+        field = (
+            np.sin(kx * x) * np.sin(ky * y) * np.sin(kz * z)
+            + np.sin(kx * x) * np.cos(ky * y) * np.cos(kz * z)
+            + np.cos(kx * x) * np.sin(ky * y) * np.cos(kz * z)
+            + np.cos(kx * x) * np.cos(ky * y) * np.sin(kz * z)
+        ) / 4.0
+        
+    elif tpms_type == 'lidinoid':
+        # Lidinoid surface
+        field = (
+            np.sin(2 * kx * x) * np.cos(ky * y) * np.sin(kz * z)
+            + np.sin(kx * x) * np.sin(2 * ky * y) * np.cos(kz * z)
+            + np.cos(kx * x) * np.sin(ky * y) * np.sin(2 * kz * z)
+            - np.cos(2 * kx * x) * np.cos(2 * ky * y)
+            - np.cos(2 * ky * y) * np.cos(2 * kz * z)
+            - np.cos(2 * kz * z) * np.cos(2 * kx * x)
+            + 0.3
+        ) / 6.0
+        
+    elif tpms_type == 'split-p':
+        # Split-P surface
+        field = (
+            1.1 * (
+                np.sin(2 * kx * x) * np.cos(ky * y) * np.sin(kz * z)
+                + np.sin(kx * x) * np.sin(2 * ky * y) * np.cos(kz * z)
+                + np.cos(kx * x) * np.sin(ky * y) * np.sin(2 * kz * z)
+            )
+            - 0.2 * (
+                np.cos(2 * kx * x) * np.cos(2 * ky * y)
+                + np.cos(2 * ky * y) * np.cos(2 * kz * z)
+                + np.cos(2 * kz * z) * np.cos(2 * kx * x)
+            )
+            - 0.4 * (
+                np.cos(2 * kx * x) + np.cos(2 * ky * y) + np.cos(2 * kz * z)
+            )
+        ) / 5.0
+        
+    else:
+        # Default to gyroid if unknown type
+        print(f"Warning: Unknown TPMS type '{tpms_type}', defaulting to 'gyroid'")
+        field = (
+            np.sin(kx * x) * np.cos(ky * y)
+            + np.sin(ky * y) * np.cos(kz * z)
+            + np.sin(kz * z) * np.cos(kx * x)
+        ) / 3.0
 
+    # Apply Gaussian smoothing if requested
     if params.smoothness > 0:
         field = ndimage.gaussian_filter(field, sigma=params.smoothness)
         max_abs = np.max(np.abs(field))
@@ -287,6 +393,10 @@ def gyroid_field(params: GyroidParameters, grid: Tuple[np.ndarray, np.ndarray, n
             field = field / max_abs
 
     return np.clip(field, -1.0, 1.0)
+
+
+# Alias for backward compatibility
+gyroid_field = tpms_field
 
 
 def compute_porosity_profile(params: GyroidParameters, nlayers: int) -> np.ndarray:
@@ -365,10 +475,10 @@ def add_bounding_box(volume: np.ndarray, spacing: Tuple[float, float, float], wa
 
 
 def generate_volume(params: GyroidParameters) -> Tuple[np.ndarray, Tuple[float, float, float], Dict[str, np.ndarray]]:
-    """Generate a binary gyroid volume enforcing the porosity profile."""
+    """Generate a binary TPMS volume enforcing the porosity profile."""
     params = validate_params(params)
     grid = generate_coordinate_grid(params)
-    field = gyroid_field(params, grid)
+    field = tpms_field(params, grid)
 
     nx = params.numx * params.nsteps
     ny = params.numy * params.nsteps
@@ -418,11 +528,11 @@ def marching_cubes_mesh(volume: np.ndarray, spacing: Tuple[float, float, float],
     return verts, faces, normals, values
 
 
-def export_stl(verts: np.ndarray, faces: np.ndarray, output_dir: Path) -> Path:
+def export_stl(verts: np.ndarray, faces: np.ndarray, output_dir: Path, tpms_type: str = 'gyroid') -> Path:
     """Write the mesh to an STL file and return the resulting path."""
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stl_path = output_dir / f"gyroid_{timestamp}.stl"
+    stl_path = output_dir / f"{tpms_type}_{timestamp}.stl"
 
     gyroid_mesh = mesh.Mesh(np.zeros(faces.shape[0], dtype=mesh.Mesh.dtype))
     for i, face in enumerate(faces):
@@ -452,7 +562,8 @@ def visualise(
     ax3d.set_ylim(0, ly)
     ax3d.set_zlim(0, lz)
     ax3d.set_box_aspect((lx, ly, lz))
-    ax3d.set_title("Gyroid STL Preview")
+    tpms_type = params.tpms_type.lower() if hasattr(params, 'tpms_type') else 'gyroid'
+    ax3d.set_title(f"{tpms_type.capitalize()} TPMS STL Preview")
     ax3d.set_xlabel("X (mm)")
     ax3d.set_ylabel("Y (mm)")
     ax3d.set_zlabel("Z (mm)")
@@ -494,7 +605,7 @@ def visualise(
 
 
 def create_gyroid(params: GyroidParameters, output_dir: Path, show_plot: bool = True) -> Path:
-    """Generate, export, and optionally visualise a gyroid lattice."""
+    """Generate, export, and optionally visualise a TPMS lattice."""
     volume, spacing, metadata = generate_volume(params)
     
     # Validate volume has some solid material
@@ -520,6 +631,9 @@ def create_gyroid(params: GyroidParameters, output_dir: Path, show_plot: bool = 
     
     verts, faces, *_ = marching_cubes_mesh(volume, spacing, params)
     
+    # Get TPMS type for filename
+    tpms_type = params.tpms_type.lower() if hasattr(params, 'tpms_type') else 'gyroid'
+    
     # Validate mesh has faces
     if len(faces) == 0:
         raise ValueError(
@@ -532,7 +646,7 @@ def create_gyroid(params: GyroidParameters, output_dir: Path, show_plot: bool = 
     if len(faces) < 100:  # Very few faces might indicate a problem
         print(f"Warning: Mesh has only {len(faces)} faces, which is quite low. Consider increasing nsteps or reducing marching_step.")
     
-    stl_path = export_stl(verts, faces, output_dir)
+    stl_path = export_stl(verts, faces, output_dir, tpms_type=tpms_type)
     
     # Validate STL file was created and has reasonable size
     if not stl_path.exists():
@@ -560,7 +674,8 @@ def main():
     output_dir = Path.cwd() / "gyroid_outputs"
     stl_path = create_gyroid(params, output_dir)
 
-    print("Generated gyroid with the following settings:")
+    tpms_type = params.tpms_type.lower() if hasattr(params, 'tpms_type') else 'gyroid'
+    print(f"Generated {tpms_type} TPMS with the following settings:")
     print(f"  numx/numy/numz: {params.numx}/{params.numy}/{params.numz}")
     print(f"  unit cell size: {params.unit_cell_size:.2f} mm")
     print(f"  porosity range: [{params.porosity_min:.2f}, {params.porosity_max:.2f}]")
