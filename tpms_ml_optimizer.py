@@ -21,7 +21,8 @@ Requirements:
     pip install scikit-learn scipy pandas numpy
 
 Usage:
-    python tpms_ml_optimizer.py
+     source ml_env/bin/activate
+     python tpms_ml_optimizer.py
 """
 
 import numpy as np
@@ -142,13 +143,33 @@ class TPMSMLOptimizer:
         df = pd.read_csv(self.dataset_path)
         print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
         
+        # Check if dataset is empty
+        if len(df) == 0:
+            raise ValueError(
+                f"Dataset is empty! The CSV file '{self.dataset_path}' has no data rows.\n"
+                f"Please run the parameter sweep first to generate data, or ensure the CSV has data rows."
+            )
+        
         # Filter successful simulations only
         if 'status' in df.columns:
             df = df[df['status'] == 'success'].copy()
             print(f"Filtered to {len(df)} successful simulations")
         
+        # Check again after filtering
+        if len(df) == 0:
+            raise ValueError(
+                f"No successful simulations found in dataset!\n"
+                f"Please ensure the CSV contains rows with 'status' == 'success'."
+            )
+        
         # Handle missing values
         df = df.dropna(subset=['compressive_strength_MPa'])
+        
+        if len(df) == 0:
+            raise ValueError(
+                f"No valid data rows after removing missing values!\n"
+                f"Please ensure the CSV contains 'compressive_strength_MPa' values."
+            )
         
         # Encode TPMS types
         if 'tpms_type' in df.columns:
@@ -627,6 +648,34 @@ class TPMSMLOptimizer:
         
         return relationships
     
+    def save_relationship_analysis(self, relationships: Dict, filepath: str = 'relationship_analysis.json'):
+        """
+        Save relationship analysis to JSON file.
+        
+        Parameters:
+        -----------
+        relationships : Dict
+            Output from analyze_relationships()
+        filepath : str
+            Path to save JSON file
+        """
+        # Convert to JSON-serializable format
+        json_data = {}
+        for target_name, data in relationships.items():
+            json_data[target_name] = {
+                'kernel': str(data.get('kernel', '')),
+                'log_marginal_likelihood': data.get('log_marginal_likelihood', 0.0),
+                'feature_names': data.get('feature_names', []),
+                'length_scales': data.get('length_scales', None),
+                'feature_importances': data.get('feature_importances', {})
+            }
+        
+        with open(filepath, 'w') as f:
+            json.dump(json_data, f, indent=2)
+        
+        print(f"\n✓ Relationship analysis saved to: {filepath}")
+        return filepath
+    
     def get_feature_interactions(self, target_name: str = 'compressive_strength_MPa') -> Dict:
         """
         Extract feature interaction patterns from the trained GPR model.
@@ -793,8 +842,17 @@ def main():
     # Save models
     optimizer.save_models()
     
-    # Analyze relationships
+    # Analyze relationships (prints to console)
+    print("\n" + "="*60)
+    print("ANALYZING RELATIONSHIPS")
+    print("="*60)
     relationships = optimizer.analyze_relationships()
+    
+    # Save relationship analysis to JSON file
+    print("\n" + "="*60)
+    print("SAVING RELATIONSHIP ANALYSIS")
+    print("="*60)
+    optimizer.save_relationship_analysis(relationships, 'relationship_analysis.json')
     
     # Example: Find optimal geometry for given load
     print("\n" + "="*60)
