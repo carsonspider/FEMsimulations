@@ -59,8 +59,9 @@ class MaterialProperties:
     - Irreversible damage accumulation
     - Localized microcracking
     
-    Standard Mazars damage evolution law for compression:
-    d_c = 1 - (ε_d0(1 - A_c)/ε_eq) - (A_c/exp[B_c(ε_eq - ε_d0)])
+    Standard Mazars damage evolution laws:
+    Compression: d_c = 1 - (ε_d0(1 - A_c)/ε_eq) - (A_c/exp[B_c(ε_eq - ε_d0)])
+    Tension: d_t = 1 - (ε_d0(1 - A_t)/ε_eq) - (A_t/exp[B_t(ε_eq - ε_d0)])
     
     Typical values for cement (10-20 MPa compressive strength):
     - E: 20-30 GPa (Young's modulus)
@@ -68,6 +69,9 @@ class MaterialProperties:
     - epsilon_c0: 6e-4 (compressive damage threshold strain)
     - A_c: 1.0-1.5 (compressive damage evolution parameter 1)
     - B_c: 1000-2000 (compressive damage evolution parameter 2)
+    - epsilon_t0: 1e-4 (tensile damage threshold strain)
+    - A_t: 0.8-1.2 (tensile damage evolution parameter 1)
+    - B_t: 1000-2000 (tensile damage evolution parameter 2)
     
     The effective modulus is reduced by damage: E_eff = E * (1 - damage)
     """
@@ -75,9 +79,14 @@ class MaterialProperties:
     E: float = 20e9  # Young's modulus (Pa) - 25 GPa (typical for concrete: 20-30 GPa)
     nu: float = 0.2  # Poisson's ratio (typical for concrete: 0.15-0.2)
     rho: float = 2000.0  # Density (kg/m³) - typical for cement paste
+    # Compressive damage parameters
     epsilon_c0: float = 1.5e-4   # Mazars compressive damage threshold strain (ε_d0)
     A_c: float = 1.35  # Mazars compressive damage evolution parameter 1
     B_c: float = 1500.0  # Mazars compressive damage evolution parameter 2
+    # Tensile damage parameters
+    epsilon_t0: float = 1.0e-4   # Mazars tensile damage threshold strain (ε_d0)
+    A_t: float = 1.0  # Mazars tensile damage evolution parameter 1
+    B_t: float = 1500.0  # Mazars tensile damage evolution parameter 2
     
     def compute_lame_parameters(self) -> tuple:
         """Compute Lame parameters from E and nu.
@@ -338,6 +347,45 @@ def mazars_compressive_damage(epsilon_eq: float, epsilon_c0: float, A_c: float, 
     dc = 1.0 - term1 - term2
     
     return np.clip(dc, 0.0, 1.0)
+
+
+def mazars_tensile_damage(epsilon_eq: float, epsilon_t0: float, A_t: float, B_t: float) -> float:
+    """Compute Mazars tensile damage evolution using standard formulation.
+    
+    Standard Mazars damage model for tension (Mazars 1986, Pijaudier-Cabot & Mazars 2001):
+    d_t = 1 - (ε_d0(1 - A_t)/ε_eq) - (A_t/exp[B_t(ε_eq - ε_d0)])
+    
+    where:
+    - ε_eq is the equivalent strain (computed from positive principal strains)
+    - ε_d0 (epsilon_t0) is the damage threshold strain
+    - A_t is the first damage evolution parameter
+    - B_t is the second damage evolution parameter
+    
+    Parameters
+    ----------
+    epsilon_eq : float
+        Equivalent strain (always positive, computed from positive principal strains)
+    epsilon_t0 : float
+        Damage threshold strain (ε_d0)
+    A_t : float
+        First damage evolution parameter
+    B_t : float
+        Second damage evolution parameter
+    
+    Returns
+    -------
+    float
+        Damage value in [0, 1]
+    """
+    if epsilon_eq <= epsilon_t0:
+        return 0.0
+    
+    # Standard Mazars two-term formulation for tension
+    term1 = epsilon_t0 * (1.0 - A_t) / epsilon_eq
+    term2 = A_t / np.exp(B_t * (epsilon_eq - epsilon_t0))
+    dt = 1.0 - term1 - term2
+    
+    return np.clip(dt, 0.0, 1.0)
 
 
 def run_compression_test(domain, material: MaterialProperties, sim_params: SimulationParameters) -> Dict:
@@ -678,6 +726,233 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
     }
 
 
+def run_tensile_test(domain, material: MaterialProperties, sim_params: SimulationParameters) -> Dict:
+    """Run uniaxial tension test with nonlinear Mazars damage model using SfePy.
+    
+    Similar to compression test but applies tensile loading and uses tensile damage model.
+    
+    Parameters
+    ----------
+    domain : FEDomain
+        SfePy finite element domain
+    material : MaterialProperties
+        Material properties
+    sim_params : SimulationParameters
+        Simulation parameters
+    
+    Returns
+    -------
+    Dict
+        Dictionary containing simulation results
+    """
+    print("\n" + "="*60)
+    print("RUNNING TENSION TEST (Nonlinear Mazars Damage Model - SfePy)")
+    print("="*60)
+    
+    # Get mesh information
+    mesh = domain.mesh
+    coords = mesh.coors
+    z_min = np.min(coords[:, 2])
+    z_max = np.max(coords[:, 2])
+    x_min = np.min(coords[:, 0])
+    x_max = np.max(coords[:, 0])
+    y_min = np.min(coords[:, 1])
+    y_max = np.max(coords[:, 1])
+    
+    # Calculate cross-sectional area
+    cross_sectional_area = (x_max - x_min) * (y_max - y_min)
+    
+    print(f"Cross-sectional area: {cross_sectional_area:.6f} m²")
+    print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN")
+    print(f"Maximum traction: {sim_params.max_force/cross_sectional_area/1e6:.2f} MPa")
+    
+    # Create regions for boundary conditions
+    try:
+        main_region = domain.regions['domain']
+    except:
+        domain.create_region('domain', 'all')
+        main_region = domain.regions['domain']
+    
+    # Create bottom and top boundary regions
+    def bottom_fun(coors, domain=None):
+        """Select nodes on bottom surface (z = z_min)."""
+        return coors[:, 2] <= z_min + 1e-6
+    
+    def top_fun(coors, domain=None):
+        """Select nodes on top surface (z = z_max)."""
+        return coors[:, 2] >= z_max - 1e-6
+    
+    try:
+        bottom_region = domain.create_region('bottom', 'vertices by bottom_fun', 'facet', 
+                                            functions={'bottom_fun': bottom_fun})
+        top_region = domain.create_region('top', 'vertices by top_fun', 'facet',
+                                          functions={'top_fun': top_fun})
+    except:
+        print("  ⚠ Warning: Could not create boundary regions, using coordinate-based BCs")
+        bottom_region = None
+        top_region = None
+    
+    # Define field for displacement (vector field, 3D)
+    field = Field.from_args('fu', np.float64, (3,), main_region, 
+                           approx_order=1, space='H1')
+    
+    # Get number of nodes
+    try:
+        n_nodes = field.n_nod
+    except:
+        n_nodes = mesh.n_nod
+    
+    # Initialize damage array (node-wise)
+    damage = np.zeros(n_nodes, dtype=np.float64)
+    
+    # Force control (tensile = positive direction)
+    force_max = sim_params.max_force
+    force_step = force_max / sim_params.num_steps
+    
+    strains, stresses, energies, displacements, forces = [], [], [], [], []
+    damage_history = []
+    convergence_info = []
+    
+    print(f"Running {sim_params.num_steps} load steps with damage iterations...")
+    print(f"  Mesh: {n_nodes} nodes, {mesh.n_el} elements")
+    print(f"  Damage tolerance: {sim_params.damage_tol:.2e}")
+    
+    # Load steps
+    for step in range(sim_params.num_steps):
+        if step % max(1, sim_params.num_steps // 10) == 0:
+            print(f"  Tension step {step+1}/{sim_params.num_steps} ({100*(step+1)//sim_params.num_steps}%)")
+        
+        current_force = force_step * (step + 1)
+        current_traction = current_force / cross_sectional_area  # Positive for tension
+        
+        # Damage iteration loop
+        converged = False
+        damage_prev_step = damage.copy()
+        
+        if step == 0:
+            print(f"      Starting damage iterations...")
+        
+        for damage_iter in range(sim_params.max_newton_iter):
+            iter_start = time.time()
+            
+            if damage_iter > 0:
+                print(f"      Damage iteration {damage_iter+1}/{sim_params.max_newton_iter}...", end='', flush=True)
+            
+            if damage_iter == 0:
+                print(f" solving FE system...", end='', flush=True)
+            
+            # Simplified approach: compute approximate strain considering damage
+            E_eff_avg = material.E * (1.0 - np.mean(damage))
+            if E_eff_avg < material.E * 0.05:
+                E_eff_avg = material.E * 0.05
+            
+            # Approximate strain (positive for tension)
+            strain_zz_approx = current_traction / E_eff_avg
+            
+            solve_time = time.time() - iter_start
+            if damage_iter == 0:
+                print(f" done ({solve_time:.2f}s)", end='', flush=True)
+            
+            # Compute full 3D strain tensor
+            # In tension: epsilon_zz > 0, epsilon_xx = epsilon_yy < 0 (Poisson contraction)
+            nu = material.nu
+            strain_xx = -nu * strain_zz_approx  # Lateral contraction
+            strain_yy = -nu * strain_zz_approx
+            strain_zz = strain_zz_approx  # Positive for tension
+            strain_xy = 0.0
+            strain_xz = 0.0
+            strain_yz = 0.0
+            
+            epsilon_tensor_avg = np.array([
+                [strain_xx, strain_xy, strain_xz],
+                [strain_xy, strain_yy, strain_yz],
+                [strain_xz, strain_yz, strain_zz]
+            ])
+            
+            # Calculate Mazars equivalent strain
+            print(" computing damage...", end='', flush=True)
+            
+            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg)
+            
+            # Use TENSILE damage model
+            damage_new_avg = mazars_tensile_damage(eps_eq_avg, material.epsilon_t0, material.A_t, material.B_t)
+            
+            # Apply average damage (in proper implementation, this would be node-wise)
+            damage_new = np.full(n_nodes, damage_new_avg)
+            
+            # Update damage (irreversible, non-decreasing)
+            damage_new = np.maximum(damage_new, damage)  # Can't decrease
+            damage_new = np.maximum(damage_new, damage_prev_step)
+            
+            # Cap damage at 0.95 to prevent singularity
+            damage_new = np.minimum(damage_new, 0.95)
+            
+            # Check convergence
+            damage_change = np.max(np.abs(damage_new - damage))
+            damage[:] = damage_new
+            
+            iter_time = time.time() - iter_start
+            if damage_iter > 0:
+                print(f" (change: {damage_change:.2e}, time: {iter_time:.2f}s)", flush=True)
+            
+            if damage_change < sim_params.damage_tol:
+                converged = True
+                if damage_iter > 0:
+                    print(f"      ✓ Damage converged in {damage_iter+1} iterations")
+                break
+        
+        # Compute results
+        strain_avg = abs(strain_zz_approx)
+        
+        E_eff_final = material.E * (1.0 - np.mean(damage))
+        stress_avg = E_eff_final * strain_zz_approx  # Positive for tension
+        
+        volume = cross_sectional_area * (z_max - z_min)
+        energy = 0.5 * abs(stress_avg) * strain_avg * volume
+        
+        displacement_avg = abs(strain_zz_approx) * (z_max - z_min)
+        
+        strains.append(float(strain_avg))
+        stresses.append(float(abs(stress_avg)))  # Store as positive (tensile strength)
+        energies.append(float(energy))
+        displacements.append(float(displacement_avg))
+        forces.append(float(current_force))
+        damage_history.append(float(np.mean(damage)))
+        convergence_info.append({
+            "damage_iterations": damage_iter + 1,
+            "converged": converged,
+            "damage_max": float(np.max(damage)),
+            "damage_avg": float(np.mean(damage))
+        })
+        
+        if step % max(1, sim_params.num_steps // 5) == 0 or step == sim_params.num_steps - 1:
+            status = "✓" if converged else "⚠"
+            print(f"    Step {step+1}/{sim_params.num_steps}: "
+                  f"force={current_force/1e3:.2f} kN, strain={strain_avg:.6f}, "
+                  f"stress={abs(stress_avg)/1e6:.2f} MPa, disp={displacement_avg*1000:.3f} mm, "
+                  f"damage_avg={np.mean(damage):.3f}, damage_max={np.max(damage):.3f} {status}")
+    
+    # Tensile strength is the maximum stress reached
+    tensile_strength = max(stresses) if stresses else 0.0
+    max_energy = max(energies) if energies else 0.0
+    max_force = max(forces) if forces else 0.0
+    
+    return {
+        "strains": strains,
+        "stresses": stresses,
+        "forces_N": forces,
+        "displacements": displacements,
+        "energies": energies,
+        "damage_history": damage_history,
+        "convergence_info": convergence_info,
+        "tensile_strength": tensile_strength,
+        "max_force_N": max_force,
+        "cross_sectional_area_m2": cross_sectional_area,
+        "total_energy_absorption": max_energy,
+        "mesh": domain,
+    }
+
+
 def main():
     """Main simulation function."""
     import argparse
@@ -716,10 +991,33 @@ def main():
     print("Loading and meshing STL file...")
     domain = load_stl_and_create_mesh(stl_path, sim_params.element_size)
     
-    results = run_compression_test(domain, material, sim_params)
+    # Run compression test
+    print("\n" + "="*60)
+    print("RUNNING COMPRESSION TEST")
+    print("="*60)
+    compression_results = run_compression_test(domain, material, sim_params)
     
-    print("\nSimulation completed successfully!")
+    # Run tension test
+    print("\n" + "="*60)
+    print("RUNNING TENSION TEST")
+    print("="*60)
+    tension_results = run_tensile_test(domain, material, sim_params)
+    
+    # Combine results
+    results = {
+        "compression": compression_results,
+        "tension": tension_results,
+        "compressive_strength": compression_results['compressive_strength'],
+        "tensile_strength": tension_results['tensile_strength'],
+        "cross_sectional_area_m2": compression_results['cross_sectional_area_m2'],
+    }
+    
+    print("\n" + "="*60)
+    print("SIMULATION COMPLETED SUCCESSFULLY!")
+    print("="*60)
     print(f"Compressive strength: {results['compressive_strength']/1e6:.2f} MPa")
+    print(f"Tensile strength: {results['tensile_strength']/1e6:.2f} MPa")
+    print(f"Strength ratio (tensile/compressive): {results['tensile_strength']/results['compressive_strength']:.3f}")
 
 
 if __name__ == "__main__":

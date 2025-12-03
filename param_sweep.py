@@ -11,7 +11,8 @@ matplotlib.use('Agg')  # Non-interactive backend
 
 import numpy as np
 
-# Import gyroid generation functions
+# Import
+#  gyroid generation functions
 from active_gyroid_gen import (
     GyroidParameters,
     
