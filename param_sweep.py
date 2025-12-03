@@ -64,11 +64,14 @@ if TEST_MODE:
     SIM_MAX_FORCE = 5000000.0  # N (5 MN - lower for faster test)
     SIM_NUM_STEPS = 2  # Just 2 steps for quick test
 else:
-    # Full parameter sweep - comprehensive range for full dataset
-    UNIT_CELL_SIZES = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]  # mm
-    WALL_THICKNESSES = [0.2, 0.3, 0.4, 0.5, 0.6]  # mm
-    POROSITY_MIN_VALUES = [0.2, 0.3, 0.4]  # Minimum porosity
-    POROSITY_MAX_VALUES = [0.5, 0.6, 0.7, 0.8]  # Maximum porosity
+    # Full parameter sweep - configured to generate ~7,000 STLs for dataset
+    # Parameter ranges designed to give approximately 7,000 combinations
+    UNIT_CELL_SIZES = [2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0]  # 13 values (mm)
+    WALL_THICKNESSES = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]  # 11 values (mm)
+    POROSITY_MIN_VALUES = [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45]  # 7 values (minimum porosity)
+    POROSITY_MAX_VALUES = [0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85]  # 10 values (maximum porosity)
+    # Expected combinations: 13 × 11 × (valid porosity pairs) ≈ 7,000
+    # Valid porosity pairs: min < max, so ~35-40 valid pairs per min value
     
     # Fixed parameters for all structures - balanced for quality and speed
     NUMX = 1  # Number of unit cells in x (single cell)
