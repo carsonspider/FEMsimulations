@@ -60,15 +60,15 @@ class MaterialProperties:
     - Localized microcracking
     
     Standard Mazars damage evolution laws:
-    Compression: d_c = 1 - (ε_d0(1 - A_c)/ε_eq) - (A_c/exp[B_c(ε_eq - ε_d0)])
-    Tension: d_t = 1 - (ε_d0(1 - A_t)/ε_eq) - (A_t/exp[B_t(ε_eq - ε_d0)])
+    Compression: d_c = 1 - (ε_d0/ε_eq) * (1 - A_c + A_c * exp[-B_c(ε_eq - ε_d0)])
+    Tension: d_t = 1 - (ε_d0/ε_eq) * (1 - A_t + A_t * exp[-B_t(ε_eq - ε_d0)])
     
-    Typical values for cement (10-20 MPa compressive strength):
-    - E: 20-30 GPa (Young's modulus)
+    Typical values for cement/concrete (10-20 MPa compressive strength):
+    - E: 25-35 GPa (Young's modulus) - Recommended: 25 GPa
     - nu: 0.15-0.2 (Poisson's ratio)
-    - epsilon_c0: 6e-4 (compressive damage threshold strain)
-    - A_c: 1.0-1.5 (compressive damage evolution parameter 1)
-    - B_c: 1000-2000 (compressive damage evolution parameter 2)
+    - epsilon_c0: 6e-4 to 1.2e-3 (compressive damage threshold strain) - Recommended: 8e-4
+    - A_c: 0.7-1.5 (compressive damage evolution parameter 1) - Recommended: 1.0
+    - B_c: 1000-2000 (compressive damage evolution parameter 2) - Recommended: 1500
     - epsilon_t0: 1e-4 (tensile damage threshold strain)
     - A_t: 0.8-1.2 (tensile damage evolution parameter 1)
     - B_t: 1000-2000 (tensile damage evolution parameter 2)
@@ -76,17 +76,17 @@ class MaterialProperties:
     The effective modulus is reduced by damage: E_eff = E * (1 - damage)
     """
     
-    E: float = 20e9  # Young's modulus (Pa) - 25 GPa (typical for concrete: 20-30 GPa)
+    E: float = 25e9  # Young's modulus (Pa) - 25 GPa (recommended: 25-35 GPa range)
     nu: float = 0.2  # Poisson's ratio (typical for concrete: 0.15-0.2)
     rho: float = 2000.0  # Density (kg/m³) - typical for cement paste
     # Compressive damage parameters
-    epsilon_c0: float = 1.5e-4   # Mazars compressive damage threshold strain (ε_d0)
-    A_c: float = 1.35  # Mazars compressive damage evolution parameter 1
-    B_c: float = 1500.0  # Mazars compressive damage evolution parameter 2
-    # Tensile damage parameters
-    epsilon_t0: float = 1.0e-4   # Mazars tensile damage threshold strain (ε_d0)
-    A_t: float = 1.0  # Mazars tensile damage evolution parameter 1
-    B_t: float = 1500.0  # Mazars tensile damage evolution parameter 2
+    epsilon_c0: float = 8e-4   # Mazars compressive damage threshold strain (ε_d0) - Recommended: 6e-4 to 1.2e-3
+    A_c: float = 1.0  # Mazars compressive damage evolution parameter 1 - Recommended: 0.7-1.5
+    B_c: float = 1500.0  # Mazars compressive damage evolution parameter 2 - Recommended: 1000-2000
+    # Tensile damage parameters (tensile strength is ~10-15% of compressive strength)
+    epsilon_t0: float = 5e-5   # Mazars tensile damage threshold strain (ε_d0) - much lower than compression
+    A_t: float = 0.7  # Mazars tensile damage evolution parameter 1 - lower than compression
+    B_t: float = 2000.0  # Mazars tensile damage evolution parameter 2 - higher for faster damage
     
     def compute_lame_parameters(self) -> tuple:
         """Compute Lame parameters from E and nu.
@@ -109,14 +109,15 @@ class SimulationParameters:
     - damage_tol: Damage field convergence tolerance
     
     Load control:
-    - Fewer steps for quick iteration
-    - Forces sufficient to reach realistic compressive strengths (10-20 MPa)
+    - Forces are automatically scaled to target 10-50 MPa stress range
+    - If max_force is None, it will be calculated from geometry
     - Reasonable element size for balance between speed and accuracy
     
-    Note: For typical 1 m² cross-section, 20 MN force ≈ 20 MPa stress
+    Note: Force is automatically scaled based on cross-sectional area to target 50 MPa
     """
     
-    max_force: float = 20000000.0  # N (20 MN default - sufficient for ~20 MPa stress on 1 m² area)
+    max_force: float = None  # N (None = auto-calculate from geometry to target 50 MPa)
+    target_stress_mpa: float = 50.0  # Target maximum stress in MPa (for auto-calculation)
     num_steps: int = 10  # Full simulation with 10 steps
     element_size: float = 0.05  # m (balanced for speed/accuracy)
     max_newton_iter: int = 10  # Maximum Newton-Raphson iterations per load step
@@ -246,38 +247,48 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         raise
 
 
-def compute_equivalent_strain(epsilon_tensor: np.ndarray) -> float:
+def compute_equivalent_strain(epsilon_tensor: np.ndarray, for_compression: bool = False) -> float:
     """Compute Mazars equivalent strain from full 3D strain tensor.
     
-    Standard Mazars model formulation:
+    For TENSION (standard Mazars formulation):
     ε_eq = √(⟨ε₁⟩₊² + ⟨ε₂⟩₊² + ⟨ε₃⟩₊²)
     where ⟨εᵢ⟩₊ = max(εᵢ, 0) is the positive part of principal strains.
     
-    This formulation uses only positive (tensile) principal strains, which
-    is the standard approach in the Mazars model. For compression, damage
-    occurs due to lateral expansion (Poisson effect) creating positive strains.
+    For COMPRESSION (modified formulation):
+    When all principal strains are negative (pure compression), use absolute values:
+    ε_eq = √(ε₁² + ε₂² + ε₃²)  (using absolute values of all principal strains)
+    
+    This ensures damage can occur in compression even when all strains are negative.
+    In compression, damage occurs due to the magnitude of compressive strains.
     
     Parameters
     ----------
     epsilon_tensor : np.ndarray, shape (3, 3)
         Full 3D symmetric strain tensor
+    for_compression : bool
+        If True, use compression formulation (absolute values). 
+        If False, use tension formulation (positive parts only).
     
     Returns
     -------
     float
-        Equivalent strain (always positive, computed from positive principal strains)
+        Equivalent strain (always positive)
     """
     # Compute principal strains (eigenvalues of strain tensor)
     eigenvals = np.linalg.eigvalsh(epsilon_tensor)  # eigvalsh for symmetric matrices
     
-    # Standard Mazars formulation: use only positive principal strains
-    # ⟨εᵢ⟩₊ = max(εᵢ, 0)
-    positive_strains = np.maximum(eigenvals, 0.0)
+    if for_compression:
+        # For compression: use absolute values of all principal strains
+        # This handles the case where all strains are negative (pure compression)
+        abs_strains = np.abs(eigenvals)
+        eps_eq_squared = np.sum(abs_strains**2)
+    else:
+        # For tension: standard Mazars formulation - use only positive principal strains
+        # ⟨εᵢ⟩₊ = max(εᵢ, 0)
+        positive_strains = np.maximum(eigenvals, 0.0)
+        eps_eq_squared = np.sum(positive_strains**2)
     
-    # Equivalent strain: ε_eq = √(Σ⟨εᵢ⟩₊²)
-    eps_eq_squared = np.sum(positive_strains**2)
-    
-    return np.sqrt(eps_eq_squared)
+    return np.sqrt(eps_eq_squared) if eps_eq_squared > 0 else 0.0
 
 
 def compute_strain_tensor_from_displacement(u_field, node_idx: int, mesh) -> np.ndarray:
@@ -314,7 +325,7 @@ def mazars_compressive_damage(epsilon_eq: float, epsilon_c0: float, A_c: float, 
     """Compute Mazars compressive damage evolution using standard formulation.
     
     Standard Mazars damage model for compression (Mazars 1986, Pijaudier-Cabot & Mazars 2001):
-    d_c = 1 - (ε_d0(1 - A_c)/ε_eq) - (A_c/exp[B_c(ε_eq - ε_d0)])
+    d_c = 1 - (ε_d0/ε_eq) * (1 - A_c + A_c * exp[-B_c(ε_eq - ε_d0)])
     
     where:
     - ε_eq is the equivalent strain (computed from positive principal strains)
@@ -341,10 +352,8 @@ def mazars_compressive_damage(epsilon_eq: float, epsilon_c0: float, A_c: float, 
     if epsilon_eq <= epsilon_c0:
         return 0.0
     
-    # Standard Mazars two-term formulation
-    term1 = epsilon_c0 * (1.0 - A_c) / epsilon_eq
-    term2 = A_c / np.exp(B_c * (epsilon_eq - epsilon_c0))
-    dc = 1.0 - term1 - term2
+    # Original Mazars formulation (corrected)
+    dc = 1.0 - (epsilon_c0 / epsilon_eq) * (1.0 - A_c + A_c * np.exp(-B_c * (epsilon_eq - epsilon_c0)))
     
     return np.clip(dc, 0.0, 1.0)
 
@@ -353,7 +362,7 @@ def mazars_tensile_damage(epsilon_eq: float, epsilon_t0: float, A_t: float, B_t:
     """Compute Mazars tensile damage evolution using standard formulation.
     
     Standard Mazars damage model for tension (Mazars 1986, Pijaudier-Cabot & Mazars 2001):
-    d_t = 1 - (ε_d0(1 - A_t)/ε_eq) - (A_t/exp[B_t(ε_eq - ε_d0)])
+    d_t = 1 - (ε_d0/ε_eq) * (1 - A_t + A_t * exp[-B_t(ε_eq - ε_d0)])
     
     where:
     - ε_eq is the equivalent strain (computed from positive principal strains)
@@ -380,10 +389,8 @@ def mazars_tensile_damage(epsilon_eq: float, epsilon_t0: float, A_t: float, B_t:
     if epsilon_eq <= epsilon_t0:
         return 0.0
     
-    # Standard Mazars two-term formulation for tension
-    term1 = epsilon_t0 * (1.0 - A_t) / epsilon_eq
-    term2 = A_t / np.exp(B_t * (epsilon_eq - epsilon_t0))
-    dt = 1.0 - term1 - term2
+    # Original Mazars formulation (corrected)
+    dt = 1.0 - (epsilon_t0 / epsilon_eq) * (1.0 - A_t + A_t * np.exp(-B_t * (epsilon_eq - epsilon_t0)))
     
     return np.clip(dt, 0.0, 1.0)
 
@@ -470,9 +477,26 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
     # Calculate cross-sectional area
     cross_sectional_area = (x_max - x_min) * (y_max - y_min)
     
-    print(f"Cross-sectional area: {cross_sectional_area:.6f} m²")
-    print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN")
-    print(f"Maximum traction: {sim_params.max_force/cross_sectional_area/1e6:.2f} MPa")
+    # Auto-calculate force if not specified, targeting desired stress
+    if sim_params.max_force is None:
+        target_stress_pa = sim_params.target_stress_mpa * 1e6  # Convert MPa to Pa
+        sim_params.max_force = target_stress_pa * cross_sectional_area
+        print(f"Auto-calculated force: {sim_params.max_force/1e3:.2f} kN (targeting {sim_params.target_stress_mpa} MPa)")
+    else:
+        print(f"Using specified force: {sim_params.max_force/1e3:.2f} kN")
+    
+    print(f"Cross-sectional area: {cross_sectional_area:.6f} m² ({cross_sectional_area*1e6:.2f} mm²)")
+    print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN ({sim_params.max_force:.0f} N)")
+    max_traction_mpa = sim_params.max_force / cross_sectional_area / 1e6
+    print(f"Maximum traction: {max_traction_mpa:.2f} MPa")
+    
+    # Warn if stress is outside reasonable range
+    if max_traction_mpa < 1.0:
+        print(f"  ⚠ WARNING: Maximum stress ({max_traction_mpa:.2f} MPa) is very low!")
+        print(f"  Consider increasing --max-force or check geometry size.")
+    elif max_traction_mpa > 100.0:
+        print(f"  ⚠ WARNING: Maximum stress ({max_traction_mpa:.1f} MPa) exceeds typical concrete strength (10-50 MPa)!")
+        print(f"  Consider reducing --max-force to avoid excessive damage/singularity.")
     
     # Create regions for boundary conditions
     try:
@@ -518,7 +542,7 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
     # Initialize damage array (node-wise)
     damage = np.zeros(n_nodes, dtype=np.float64)
     
-    # Force control
+    # Force control - use sim_params.max_force (already calculated/auto-calculated in this function)
     force_max = sim_params.max_force
     force_step = force_max / sim_params.num_steps
     
@@ -626,8 +650,8 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
             print(" computing damage...", end='', flush=True)
             
             # Compute equivalent strain from full 3D strain tensor
-            # For each node, we need the strain tensor (in proper implementation, this varies per node)
-            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg)
+            # For compression: use compression formulation (absolute values)
+            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg, for_compression=True)
             
             # Compute damage at each node (in proper implementation, this would vary per node)
             # For now, compute average damage
@@ -762,9 +786,21 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
     # Calculate cross-sectional area
     cross_sectional_area = (x_max - x_min) * (y_max - y_min)
     
-    print(f"Cross-sectional area: {cross_sectional_area:.6f} m²")
-    print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN")
-    print(f"Maximum traction: {sim_params.max_force/cross_sectional_area/1e6:.2f} MPa")
+    # Auto-calculate force if not specified (use same target as compression - let damage model determine failure)
+    # The tensile strength will be naturally lower due to lower threshold and faster damage evolution
+    if sim_params.max_force is None:
+        target_stress_pa = sim_params.target_stress_mpa * 1e6  # Convert MPa to Pa
+        sim_params.max_force = target_stress_pa * cross_sectional_area
+        print(f"Auto-calculated force: {sim_params.max_force/1e3:.2f} kN (targeting {sim_params.target_stress_mpa} MPa)")
+    else:
+        # Use same force as compression - damage model will determine when failure occurs
+        print(f"Using specified force: {sim_params.max_force/1e3:.2f} kN (same as compression test)")
+    
+    print(f"Cross-sectional area: {cross_sectional_area:.6f} m² ({cross_sectional_area*1e6:.2f} mm²)")
+    print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN ({sim_params.max_force:.0f} N)")
+    max_traction_mpa = sim_params.max_force / cross_sectional_area / 1e6
+    print(f"Maximum traction: {max_traction_mpa:.2f} MPa")
+    print(f"Note: Tensile strength will be lower due to lower damage threshold (ε_t0={material.epsilon_t0:.1e} vs ε_c0={material.epsilon_c0:.1e})")
     
     # Create regions for boundary conditions
     try:
@@ -872,7 +908,8 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
             # Calculate Mazars equivalent strain
             print(" computing damage...", end='', flush=True)
             
-            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg)
+            # For tension: use standard formulation (positive parts only)
+            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg, for_compression=False)
             
             # Use TENSILE damage model
             damage_new_avg = mazars_tensile_damage(eps_eq_avg, material.epsilon_t0, material.A_t, material.B_t)
@@ -932,8 +969,39 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
                   f"stress={abs(stress_avg)/1e6:.2f} MPa, disp={displacement_avg*1000:.3f} mm, "
                   f"damage_avg={np.mean(damage):.3f}, damage_max={np.max(damage):.3f} {status}")
     
-    # Tensile strength is the maximum stress reached
-    tensile_strength = max(stresses) if stresses else 0.0
+    # Tensile strength: use stress when damage first exceeds threshold (typically 0.3-0.5 for significant failure)
+    # Concrete fails at much lower stress in tension due to lower threshold and faster damage evolution
+    # The damage model naturally produces lower tensile strength because:
+    # 1. Lower threshold: epsilon_t0 = 5e-5 vs epsilon_c0 = 8e-4 (16x lower)
+    # 2. Faster damage evolution: A_t = 0.7, B_t = 2000.0
+    # 
+    # Calculate as stress when damage first exceeds 0.5 (50% damage = significant failure)
+    tensile_strength = 0.0
+    for i, (stress, damage) in enumerate(zip(stresses, damage_history)):
+        if damage > 0.5:  # Significant damage threshold
+            # If damage jumped from low to high, interpolate to find when it crossed 0.5
+            if i > 0 and damage_history[i-1] < 0.5:
+                # Linear interpolation between previous and current step
+                prev_stress = stresses[i-1] if i > 0 else 0.0
+                prev_damage = damage_history[i-1] if i > 0 else 0.0
+                if damage > prev_damage:  # Avoid division by zero
+                    frac = (0.5 - prev_damage) / (damage - prev_damage)
+                    tensile_strength = prev_stress + frac * (stress - prev_stress)
+                else:
+                    tensile_strength = stress
+            else:
+                tensile_strength = stress
+            break
+    
+    # If no damage exceeded 0.5, use stress at which damage first becomes non-zero
+    if tensile_strength == 0.0:
+        for i, (stress, damage) in enumerate(zip(stresses, damage_history)):
+            if damage > 0.0:
+                tensile_strength = stress
+                break
+        if tensile_strength == 0.0:
+            tensile_strength = max(stresses) if stresses else 0.0
+    
     max_energy = max(energies) if energies else 0.0
     max_force = max(forces) if forces else 0.0
     
@@ -961,7 +1029,8 @@ def main():
     parser.add_argument("stl_file", type=str, help="Path to input STL file")
     parser.add_argument("--output-dir", type=str, default="compression_results", help="Output directory")
     parser.add_argument("--element-size", type=float, default=0.05, help="Mesh element size (m)")
-    parser.add_argument("--max-force", type=float, default=20000000.0, help="Maximum force to apply (N)")
+    parser.add_argument("--max-force", type=float, default=None, help="Maximum force to apply (N). If None, auto-calculates to target stress.")
+    parser.add_argument("--target-stress", type=float, default=50.0, help="Target maximum stress in MPa (used if --max-force is not specified)")
     parser.add_argument("--num-steps", type=int, default=10, help="Number of load steps")
     
     args = parser.parse_args()
@@ -979,12 +1048,16 @@ def main():
     print(f"STL file: {stl_path}")
     print(f"Element size: {args.element_size} m")
     print(f"Number of steps: {args.num_steps}")
-    print(f"Max force: {args.max_force/1e3:.2f} kN")
+    if args.max_force is not None:
+        print(f"Max force: {args.max_force/1e3:.2f} kN")
+    else:
+        print(f"Max force: Auto-calculate (targeting {args.target_stress} MPa)")
     
     material = MaterialProperties()
     sim_params = SimulationParameters(
         element_size=args.element_size,
         max_force=args.max_force,
+        target_stress_mpa=args.target_stress,
         num_steps=args.num_steps,
     )
     
