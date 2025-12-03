@@ -109,15 +109,17 @@ class SimulationParameters:
     - damage_tol: Damage field convergence tolerance
     
     Load control:
-    - Forces are automatically scaled to target 10-50 MPa stress range
-    - If max_force is None, it will be calculated from geometry
+    - Fixed force (default 3.5 kN) applied to all geometries for fair comparison
+    - For 10mm structures (0.01m × 0.01m), this targets ~35 MPa stress
+    - If max_force is None, it will be auto-calculated from geometry to target stress
     - Reasonable element size for balance between speed and accuracy
     
-    Note: Force is automatically scaled based on cross-sectional area to target 50 MPa
+    Note: Fixed force ensures all structures experience the same load, enabling
+    fair comparison of failure strengths based on internal geometry differences.
     """
     
-    max_force: float = None  # N (None = auto-calculate from geometry to target 50 MPa)
-    target_stress_mpa: float = 50.0  # Target maximum stress in MPa (for auto-calculation)
+    max_force: float = 3500.0  # N (Fixed force for all geometries - targets ~35 MPa for 10mm structures)
+    target_stress_mpa: float = 35.0  # Target maximum stress in MPa (used only if max_force is None for auto-calculation)
     num_steps: int = 10  # Full simulation with 10 steps
     element_size: float = 0.05  # m (balanced for speed/accuracy)
     max_newton_iter: int = 10  # Maximum Newton-Raphson iterations per load step
@@ -153,12 +155,14 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         
         # Auto-detect units: if max dimension > 10, assume mm and convert to m
         max_dim = np.max(bbox_max - bbox_min)
+        units_converted = False
         if max_dim > 10.0:
             print(f"Detected STL in millimeters (max dimension: {max_dim:.2f} mm)")
             print(f"Converting to meters for simulation...")
             bbox_min = bbox_min / 1000.0
             bbox_max = bbox_max / 1000.0
             max_dim = np.max(bbox_max - bbox_min)
+            units_converted = True
             print(f"Converted bounding box: {bbox_min} to {bbox_max} (m)")
         else:
             print(f"STL appears to be in meters (max dimension: {max_dim:.2f} m)")
@@ -215,11 +219,28 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         cells_array = np.array(cells, dtype=np.int32)
         
         # SfePy expects:
-        # - coors: coordinates array (N, 3)
+        # - coors: coordinates array (N, 3) - MUST be in meters for correct stress calculations
         # - conns: list of connectivity arrays, one per element type
         # - mat_ids: material IDs (all 0 for now)
         # - descs: element descriptor ('3_8' for 3D hexahedra with 8 nodes)
         coors = points.astype(np.float64)
+        
+        # CRITICAL: Verify coordinates are in meters (should be after unit conversion above)
+        # For 10mm structures, dimensions should be ~0.01m. If > 0.1m, likely still in mm
+        coors_size = np.max(coors, axis=0) - np.min(coors, axis=0)
+        max_coor_size = np.max(coors_size)
+        if max_coor_size > 0.1:  # If any dimension > 0.1m (100mm), likely still in mm
+            print(f"⚠ WARNING: Mesh coordinates appear to be in wrong units!")
+            print(f"  Mesh size: {coors_size} m (max: {max_coor_size:.3f} m)")
+            print(f"  Expected: < 0.1m for structures up to 100mm")
+            print(f"  Converting coordinates from mm to m...")
+            coors = coors / 1000.0
+            coors_size = np.max(coors, axis=0) - np.min(coors, axis=0)
+            max_coor_size = np.max(coors_size)
+            print(f"  Converted mesh size: {coors_size} m (max: {max_coor_size:.6f} m)")
+            if max_coor_size > 0.1:
+                raise ValueError(f"Mesh coordinates still too large after conversion: {coors_size} m. Check unit conversion logic.")
+        
         conns = [cells_array]
         mat_ids = [np.zeros(len(cells), dtype=np.int32)]
         descs = ['3_8']  # 3D hexahedra
@@ -231,7 +252,12 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
             
             num_vertices = mesh.n_nod
             num_cells = mesh.n_el
+            # Verify final mesh dimensions
+            final_coords = mesh.coors
+            final_size = np.max(final_coords, axis=0) - np.min(final_coords, axis=0)
             print(f"Mesh created: {num_vertices} vertices, {num_cells} cells")
+            print(f"Mesh dimensions: {final_size[0]:.6f} × {final_size[1]:.6f} × {final_size[2]:.6f} m")
+            print(f"Expected cross-sectional area: {final_size[0] * final_size[1]:.6f} m² ({final_size[0] * final_size[1] * 1e6:.2f} mm²)")
             
             return domain
         except Exception as e:
@@ -247,46 +273,37 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         raise
 
 
-def compute_equivalent_strain(epsilon_tensor: np.ndarray, for_compression: bool = False) -> float:
+def compute_equivalent_strain(epsilon_tensor: np.ndarray) -> float:
     """Compute Mazars equivalent strain from full 3D strain tensor.
     
-    For TENSION (standard Mazars formulation):
-    ε_eq = √(⟨ε₁⟩₊² + ⟨ε₂⟩₊² + ⟨ε₃⟩₊²)
-    where ⟨εᵢ⟩₊ = max(εᵢ, 0) is the positive part of principal strains.
+    Standard Mazars formulation (Mazars 1986):
+    ε_eq = √(Σ⟨εᵢ⟩₊²)
+    where ⟨εᵢ⟩₊ = max(εᵢ, 0) is the positive part (Macaulay bracket) of principal strains.
     
-    For COMPRESSION (modified formulation):
-    When all principal strains are negative (pure compression), use absolute values:
-    ε_eq = √(ε₁² + ε₂² + ε₃²)  (using absolute values of all principal strains)
-    
-    This ensures damage can occur in compression even when all strains are negative.
-    In compression, damage occurs due to the magnitude of compressive strains.
+    This formulation uses only positive (tensile) principal strains, which is the
+    standard approach in the Mazars model. For compression, damage occurs due to
+    lateral expansion (Poisson effect) creating positive strains, not from the
+    compressive strains themselves.
     
     Parameters
     ----------
     epsilon_tensor : np.ndarray, shape (3, 3)
         Full 3D symmetric strain tensor
-    for_compression : bool
-        If True, use compression formulation (absolute values). 
-        If False, use tension formulation (positive parts only).
     
     Returns
     -------
     float
-        Equivalent strain (always positive)
+        Equivalent strain (always positive, computed from positive principal strains)
     """
     # Compute principal strains (eigenvalues of strain tensor)
     eigenvals = np.linalg.eigvalsh(epsilon_tensor)  # eigvalsh for symmetric matrices
     
-    if for_compression:
-        # For compression: use absolute values of all principal strains
-        # This handles the case where all strains are negative (pure compression)
-        abs_strains = np.abs(eigenvals)
-        eps_eq_squared = np.sum(abs_strains**2)
-    else:
-        # For tension: standard Mazars formulation - use only positive principal strains
-        # ⟨εᵢ⟩₊ = max(εᵢ, 0)
-        positive_strains = np.maximum(eigenvals, 0.0)
-        eps_eq_squared = np.sum(positive_strains**2)
+    # Standard Mazars formulation: use only positive principal strains (Macaulay brackets)
+    # ⟨εᵢ⟩₊ = max(εᵢ, 0)
+    positive_strains = np.maximum(eigenvals, 0.0)
+    
+    # Equivalent strain: ε_eq = √(Σ⟨εᵢ⟩₊²)
+    eps_eq_squared = np.sum(positive_strains**2)
     
     return np.sqrt(eps_eq_squared) if eps_eq_squared > 0 else 0.0
 
@@ -474,21 +491,24 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
     y_min = np.min(coords[:, 1])
     y_max = np.max(coords[:, 1])
     
-    # Calculate cross-sectional area
+    # Calculate cross-sectional area from mesh bounding box
+    # For fixed-size structures (e.g., 10mm cubes from param_sweep), this should be consistent
+    # Expected: 0.01m × 0.01m = 0.0001 m² (100 mm²)
     cross_sectional_area = (x_max - x_min) * (y_max - y_min)
     
-    # Auto-calculate force if not specified, targeting desired stress
+    # Use specified force (should be consistent across all geometries for fair comparison)
     if sim_params.max_force is None:
+        # Fallback: auto-calculate if not specified (but should be specified for parameter sweeps)
         target_stress_pa = sim_params.target_stress_mpa * 1e6  # Convert MPa to Pa
         sim_params.max_force = target_stress_pa * cross_sectional_area
         print(f"Auto-calculated force: {sim_params.max_force/1e3:.2f} kN (targeting {sim_params.target_stress_mpa} MPa)")
     else:
-        print(f"Using specified force: {sim_params.max_force/1e3:.2f} kN")
+        print(f"Using fixed force: {sim_params.max_force/1e3:.2f} kN (same for all geometries)")
     
     print(f"Cross-sectional area: {cross_sectional_area:.6f} m² ({cross_sectional_area*1e6:.2f} mm²)")
     print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN ({sim_params.max_force:.0f} N)")
     max_traction_mpa = sim_params.max_force / cross_sectional_area / 1e6
-    print(f"Maximum traction: {max_traction_mpa:.2f} MPa")
+    print(f"Maximum traction: {max_traction_mpa:.2f} MPa (varies by geometry)")
     
     # Warn if stress is outside reasonable range
     if max_traction_mpa < 1.0:
@@ -650,8 +670,8 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
             print(" computing damage...", end='', flush=True)
             
             # Compute equivalent strain from full 3D strain tensor
-            # For compression: use compression formulation (absolute values)
-            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg, for_compression=True)
+            # Standard Mazars formulation: uses only positive principal strains (Macaulay brackets)
+            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg)
             
             # Compute damage at each node (in proper implementation, this would vary per node)
             # For now, compute average damage
@@ -729,8 +749,40 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
                   f"stress={abs(stress_avg)/1e6:.2f} MPa, disp={displacement_avg*1000:.3f} mm, "
                   f"damage_avg={np.mean(damage):.3f}, damage_max={np.max(damage):.3f} {status}")
     
-    # Compressive strength is the maximum stress reached
-    compressive_strength = max(stresses) if stresses else 0.0
+    # Compressive strength: use stress when damage first exceeds threshold (typically 0.3-0.5 for significant failure)
+    # This represents the actual failure strength, not just the maximum applied stress
+    compressive_strength = 0.0
+    for i, (stress, damage) in enumerate(zip(stresses, damage_history)):
+        if damage > 0.5:  # Significant damage threshold (50% damage = significant failure)
+            # If damage jumped from low to high, interpolate to find when it crossed 0.5
+            if i > 0 and damage_history[i-1] < 0.5:
+                # Linear interpolation between previous and current step
+                prev_stress = stresses[i-1] if i > 0 else 0.0
+                prev_damage = damage_history[i-1] if i > 0 else 0.0
+                if damage > prev_damage:  # Avoid division by zero
+                    frac = (0.5 - prev_damage) / (damage - prev_damage)
+                    compressive_strength = prev_stress + frac * (stress - prev_stress)
+                else:
+                    compressive_strength = stress
+            else:
+                compressive_strength = stress
+            break
+    
+    # If no damage exceeded 0.5, use stress at peak (before damage causes softening)
+    # Find peak stress (maximum stress before significant damage accumulation)
+    if compressive_strength == 0.0:
+        # Find the stress at which damage starts increasing significantly
+        if len(damage_history) > 1:
+            damage_changes = [damage_history[i] - damage_history[i-1] for i in range(1, len(damage_history))]
+            if any(dc > 0.1 for dc in damage_changes):  # Significant damage increase
+                # Use stress just before significant damage increase
+                for i in range(1, len(damage_history)):
+                    if damage_history[i] - damage_history[i-1] > 0.1:
+                        compressive_strength = stresses[i-1] if i > 0 else stresses[0]
+                        break
+        if compressive_strength == 0.0:
+            # Fallback: use maximum stress reached (but this will be the target stress if auto-calculated)
+            compressive_strength = max(stresses) if stresses else 0.0
     max_energy = max(energies) if energies else 0.0
     max_force = max(forces) if forces else 0.0
     
@@ -783,23 +835,24 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
     y_min = np.min(coords[:, 1])
     y_max = np.max(coords[:, 1])
     
-    # Calculate cross-sectional area
+    # Calculate cross-sectional area from mesh bounding box
+    # For fixed-size structures (e.g., 10mm cubes from param_sweep), this should be consistent
+    # Expected: 0.01m × 0.01m = 0.0001 m² (100 mm²)
     cross_sectional_area = (x_max - x_min) * (y_max - y_min)
     
-    # Auto-calculate force if not specified (use same target as compression - let damage model determine failure)
-    # The tensile strength will be naturally lower due to lower threshold and faster damage evolution
+    # Use specified force (should be consistent across all geometries for fair comparison)
     if sim_params.max_force is None:
+        # Fallback: auto-calculate if not specified (but should be specified for parameter sweeps)
         target_stress_pa = sim_params.target_stress_mpa * 1e6  # Convert MPa to Pa
         sim_params.max_force = target_stress_pa * cross_sectional_area
         print(f"Auto-calculated force: {sim_params.max_force/1e3:.2f} kN (targeting {sim_params.target_stress_mpa} MPa)")
     else:
-        # Use same force as compression - damage model will determine when failure occurs
-        print(f"Using specified force: {sim_params.max_force/1e3:.2f} kN (same as compression test)")
+        print(f"Using fixed force: {sim_params.max_force/1e3:.2f} kN (same for all geometries)")
     
     print(f"Cross-sectional area: {cross_sectional_area:.6f} m² ({cross_sectional_area*1e6:.2f} mm²)")
     print(f"Maximum force: {sim_params.max_force/1e3:.2f} kN ({sim_params.max_force:.0f} N)")
     max_traction_mpa = sim_params.max_force / cross_sectional_area / 1e6
-    print(f"Maximum traction: {max_traction_mpa:.2f} MPa")
+    print(f"Maximum traction: {max_traction_mpa:.2f} MPa (varies by geometry)")
     print(f"Note: Tensile strength will be lower due to lower damage threshold (ε_t0={material.epsilon_t0:.1e} vs ε_c0={material.epsilon_c0:.1e})")
     
     # Create regions for boundary conditions
@@ -908,8 +961,8 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
             # Calculate Mazars equivalent strain
             print(" computing damage...", end='', flush=True)
             
-            # For tension: use standard formulation (positive parts only)
-            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg, for_compression=False)
+            # Standard Mazars formulation: uses only positive principal strains (Macaulay brackets)
+            eps_eq_avg = compute_equivalent_strain(epsilon_tensor_avg)
             
             # Use TENSILE damage model
             damage_new_avg = mazars_tensile_damage(eps_eq_avg, material.epsilon_t0, material.A_t, material.B_t)

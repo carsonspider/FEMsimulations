@@ -13,6 +13,7 @@ import numpy as np
 
 # Import
 #  gyroid generation functions
+
 from active_gyroid_gen import (
     GyroidParameters,
     
@@ -20,12 +21,14 @@ from active_gyroid_gen import (
     create_gyroid
 )
 
-# Import simulation functions from mazers_model_active
+# 
+#Import simulation functions from mazers_model_active
 from mazars_model_sfepy import (
     MaterialProperties,
     SimulationParameters,
     load_stl_and_create_mesh,
-    run_compression_test
+    run_compression_test,
+    run_tensile_test
 )
 
 
@@ -36,31 +39,34 @@ from mazars_model_sfepy import (
 TPMS_TYPES = ['gyroid', 'schwarz', 'diamond', 'lidinoid', 'split-p']
 
 # Unit cell sizes to test (mm) - comprehensive range for full dataset
-UNIT_CELL_SIZES = [0.2, 0.3, 0.4, 0.5, 0.6]  # mm
+# Note: Very small cells with thin walls and high porosity may fail
+UNIT_CELL_SIZES = [0.5, 0.6, 0.7, 0.8, 1.0]  # mm (increased minimum to 0.5mm for reliability)
 
 # Wall thickness values to test (mm) - comprehensive range for full dataset
-WALL_THICKNESSES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]  # mm
+# Note: Wall thickness should be at least 30% of unit cell size for valid geometry
+WALL_THICKNESSES = [0.3, 0.4, 0.5, 0.6, 0.7]  # mm (increased minimum to 0.3mm for reliability)
 
 # Porosity ranges to test - comprehensive range for full dataset
 POROSITY_MIN_VALUES = [0.2, 0.3, 0.4, 0.5]  # Minimum porosity
 POROSITY_MAX_VALUES = [0.5, 0.6, 0.7, 0.8, 0.9]  # Maximum porosity
 
-# Function degree values to test
-FUNC_DEGREE_VALUES = [1, 2, 3]  # Linear, quadratic, cubic gradient
+# Function degree values to test (0=constant, 1=linear, 2=quadratic)
+FUNC_DEGREE_VALUES = [1, 2]  # Linear, quadratic gradient (cubic not supported)
 
 # Fixed parameters for all structures - balanced for quality and speed
-NUMX = 1  # Number of unit cells in x (single cell)
-NUMY = 1  # Number of unit cells in y (single cell)
-NUMZ = 1  # Number of unit cells in z (single cell)
-NSTEPS = 20  # Voxel resolution per unit cell (balanced quality/speed)
+# FIXED VOLUME: All structures will have the same overall dimensions
+FIXED_SIZE_MM = 10.0  # Fixed size in mm (all structures will be 10mm x 10mm x 10mm cubes)
+NSTEPS = 25  # Voxel resolution per unit cell (increased for better geometry capture)
 GRAD = 1  # Graded porosity (1) or constant (0)
 DELTA = 0.2  # Porosity tolerance
 SMOOTHNESS = 0.8  # Gaussian smoothing
-MARCHING_STEP = 2  # Marching cubes resolution (balanced quality/speed)
+MARCHING_STEP = 1  # Marching cubes resolution (reduced from 2 to 1 for finer meshes)
 
 # Simulation parameters - FULL simulations
 SIM_ELEMENT_SIZE = 0.05  # m (balanced for accuracy)
-SIM_MAX_FORCE = 30.0  # N (targets 10-50 MPa stress range for 0.2-0.6 mm unit cells)
+# Fixed force: For 10mm cube (0.01m × 0.01m = 0.0001 m²), targeting ~35 MPa stress
+# Force = Stress × Area = 35e6 Pa × 0.0001 m² = 3500 N = 3.5 kN
+SIM_MAX_FORCE = 3500.0  # Fixed force in N (3.5 kN) - targets ~35 MPa for 10mm structures
 SIM_NUM_STEPS = 10  # Full simulation with 10 steps
 
 # Test limit - set to None to test all combinations
@@ -77,16 +83,36 @@ GYROID_OUTPUT_DIR.mkdir(exist_ok=True)
 def generate_gyroid_structure(unit_cell_size: float, wall_thickness: float,
                                porosity_min: float, porosity_max: float,
                                output_stl_path: Path, tpms_type: str = 'gyroid', func_degree: int = 1) -> Tuple[bool, Path]:
-    """Generate TPMS STL file with given parameters using active_gyroid_gen."""
+    """Generate TPMS STL file with given parameters using active_gyroid_gen.
+    
+    All structures will have the same overall dimensions (FIXED_SIZE_MM x FIXED_SIZE_MM x FIXED_SIZE_MM).
+    The number of unit cells is calculated to fill this fixed volume based on unit_cell_size.
+    """
     try:
+        # Calculate number of unit cells needed to fill the fixed volume
+        # Round down to ensure we don't exceed the fixed size
+        numx = int(FIXED_SIZE_MM / unit_cell_size)
+        numy = int(FIXED_SIZE_MM / unit_cell_size)
+        numz = int(FIXED_SIZE_MM / unit_cell_size)
+        
+        # Ensure at least 1 unit cell in each direction
+        numx = max(1, numx)
+        numy = max(1, numy)
+        numz = max(1, numz)
+        
+        actual_size_x = numx * unit_cell_size
+        actual_size_y = numy * unit_cell_size
+        actual_size_z = numz * unit_cell_size
+        
         print(f"Generating {tpms_type} TPMS: cell_size={unit_cell_size}mm, wall={wall_thickness}mm, "
               f"porosity=[{porosity_min:.2f}, {porosity_max:.2f}], func_degree={func_degree}")
+        print(f"  Fixed volume: {FIXED_SIZE_MM}mm³ → {numx}x{numy}x{numz} cells = {actual_size_x:.2f}x{actual_size_y:.2f}x{actual_size_z:.2f}mm")
 
         # Create GyroidParameters using the new API
         params = GyroidParameters(
-            numx=NUMX,
-            numy=NUMY,
-            numz=NUMZ,
+            numx=numx,
+            numy=numy,
+            numz=numz,
             unit_cell_size=unit_cell_size,
             nsteps=NSTEPS,
             porosity_min=porosity_min,
@@ -114,6 +140,13 @@ def generate_gyroid_structure(unit_cell_size: float, wall_thickness: float,
             print(f"✗ STL file not created at {stl_path}")
             return False, output_stl_path
 
+    except ValueError as e:
+        # Handle specific errors like "Surface level must be within volume data range"
+        if "Surface level must be within volume data range" in str(e):
+            print(f"✗ Invalid geometry: parameters produce empty/invalid volume (likely wall too thin or cell too small)")
+        else:
+            print(f"✗ Validation error: {e}")
+        return False, output_stl_path
     except Exception as e:
         print(f"✗ Error generating gyroid: {e}")
         import traceback
@@ -129,9 +162,12 @@ def run_simulation(stl_path: Path) -> Dict:
         material = MaterialProperties()
 
         # Simulation parameters
+        # Use fixed force for all geometries to enable fair comparison
+        # All structures have the same fixed size (10mm × 10mm × 10mm), so cross-sectional area is the same
         sim_params = SimulationParameters(
             element_size=SIM_ELEMENT_SIZE,
-            max_force=SIM_MAX_FORCE,
+            max_force=SIM_MAX_FORCE,  # Fixed force (same for all geometries)
+            target_stress_mpa=35.0,  # Not used when max_force is specified, but updated to match default
             num_steps=SIM_NUM_STEPS,
         )
 
@@ -139,9 +175,21 @@ def run_simulation(stl_path: Path) -> Dict:
         fenics_mesh = load_stl_and_create_mesh(stl_path, sim_params.element_size)
 
         # Run compression test
-        results = run_compression_test(fenics_mesh, material, sim_params)
+        compression_results = run_compression_test(fenics_mesh, material, sim_params)
+        
+        # Run tension test
+        tension_results = run_tensile_test(fenics_mesh, material, sim_params)
+        
+        # Combine results (similar to main() function in mazars_model_sfepy.py)
+        results = {
+            "compression": compression_results,
+            "tension": tension_results,
+            "compressive_strength": compression_results['compressive_strength'],
+            "tensile_strength": tension_results['tensile_strength'],
+            "cross_sectional_area_m2": compression_results['cross_sectional_area_m2'],
+        }
 
-        print(f"✓ Simulation completed")
+        print(f"✓ Simulation completed (compression + tension)")
         return results
 
     except Exception as e:
@@ -190,8 +238,10 @@ def main():
     print(f"Porosity min values: {POROSITY_MIN_VALUES}")
     print(f"Porosity max values: {POROSITY_MAX_VALUES}")
     print(f"Function degree values: {FUNC_DEGREE_VALUES}")
-    print(f"Mesh resolution: {NSTEPS} voxels/unit cell (reduced for speed)")
-    print(f"Marching cubes step: {MARCHING_STEP} (lower = faster)")
+    print(f"FIXED VOLUME: All structures = {FIXED_SIZE_MM}mm × {FIXED_SIZE_MM}mm × {FIXED_SIZE_MM}mm")
+    print(f"  (Number of unit cells adjusts automatically based on unit_cell_size)")
+    print(f"Mesh resolution: {NSTEPS} voxels/unit cell")
+    print(f"Marching cubes step: {MARCHING_STEP}")
     print(f"Simulation steps: {SIM_NUM_STEPS} (full simulation)")
     total_combinations = len(TPMS_TYPES) * len(UNIT_CELL_SIZES) * len(WALL_THICKNESSES) * len(POROSITY_MIN_VALUES) * len(POROSITY_MAX_VALUES) * len(FUNC_DEGREE_VALUES)
     print(f"Total possible combinations: {total_combinations}")
@@ -240,6 +290,18 @@ def main():
                         for func_degree in FUNC_DEGREE_VALUES:
                             # Skip if min > max
                             if porosity_min > porosity_max:
+                                continue
+                            
+                            # Skip if wall thickness is too small relative to unit cell size
+                            # Wall thickness should be at least 30% of unit cell size for valid geometry
+                            if wall_thickness < 0.3 * unit_cell_size:
+                                print(f"  Skipping: wall_thickness ({wall_thickness}mm) too small for unit_cell_size ({unit_cell_size}mm)")
+                                continue
+                            
+                            # Skip if high porosity with thin walls (likely to fail)
+                            # High porosity (>0.7) with thin walls (<0.4mm) often produces invalid geometries
+                            if porosity_max > 0.7 and wall_thickness < 0.4:
+                                print(f"  Skipping: high porosity ({porosity_max:.2f}) with thin wall ({wall_thickness}mm) likely to fail")
                                 continue
 
                             # Check if we've reached the limit (before processing)
