@@ -619,11 +619,12 @@ class EarthquakeSimulator:
         # Generate 3D points (tensor product)
         points = []
         weights = []
-        for xi in xi_1d:
-            for eta in xi_1d:
-                for zeta in xi_1d:
+        for i, xi in enumerate(xi_1d):
+            for j, eta in enumerate(xi_1d):
+                for k, zeta in enumerate(xi_1d):
                     points.append([xi, eta, zeta])
-                    weights.append(w_1d[0] * w_1d[0] * w_1d[0])  # Product of 1D weights
+                    # Correct: product of corresponding 1D weights
+                    weights.append(w_1d[i] * w_1d[j] * w_1d[k])
         
         return np.array(points), np.array(weights)
     
@@ -838,25 +839,158 @@ class EarthquakeSimulator:
         print(f"  Boundary conditions: {len(base_nodes)} base nodes fixed ({len(self.fixed_dof)} DOF)")
     
     def _compute_strain_from_displacement(self, u: np.ndarray) -> np.ndarray:
-        """Compute average strain tensor from displacement
+        """Compute strain tensor from displacement using proper FE formulation
         
-        TODO: Implement proper FE strain computation
+        Uses B matrix to compute: epsilon = B * u_e at element level
+        Returns average strain tensor for the structure.
+        
+        For proper implementation, computes strain at each Gauss point
+        and integrates/averages over the domain.
         """
-        # Simplified: return average strain tensor
-        # In proper implementation, compute from grad(u) at each node
-        n_nodes = self.domain.mesh.n_nod
-        u_reshaped = u.reshape(n_nodes, 3)
+        mesh = self.domain.mesh
+        coors = mesh.coors
         
-        # Simplified strain (needs proper FE gradient computation)
-        strain_avg = np.mean(np.abs(u_reshaped), axis=0) / 0.03  # Divide by characteristic length
-        strain_tensor = np.diag(strain_avg)
+        # Get element connectivity
+        # SfePy stores connectivity in different ways depending on mesh creation
+        if hasattr(mesh, 'conns') and len(mesh.conns) > 0:
+            conn = mesh.conns[0]
+        elif hasattr(mesh, 'get_conn'):
+            try:
+                conn = mesh.get_conn('3_8')
+            except:
+                try:
+                    conn = mesh.get_conn()
+                except:
+                    # Try accessing through domain
+                    if hasattr(self.domain, 'mesh'):
+                        conn = self.domain.mesh.conns[0] if hasattr(self.domain.mesh, 'conns') else None
+                    else:
+                        conn = None
+        else:
+            conn = None
+        
+        if conn is None:
+            # Fallback: simplified computation
+            n_nodes = mesh.n_nod
+            u_reshaped = u.reshape(n_nodes, 3)
+            strain_avg = np.mean(np.abs(u_reshaped), axis=0) / 0.03
+            strain_tensor = np.diag(strain_avg)
+            return strain_tensor
+        
+        # Accumulate strain contributions from all elements
+        strain_sum = np.zeros((6,))  # [ε_xx, ε_yy, ε_zz, γ_xy, γ_xz, γ_yz]
+        volume_sum = 0.0
+        
+        # Gauss quadrature
+        gauss_points, gauss_weights = self._get_gauss_quadrature_3d(2)
+        
+        # Process each element
+        for el_conn in conn:
+            el_coors = coors[el_conn]
+            # Extract element displacement vector (24 DOF: 8 nodes × 3)
+            u_el = np.zeros(24)
+            for i, node_idx in enumerate(el_conn):
+                u_el[i * 3] = u[node_idx * 3]         # u_x
+                u_el[i * 3 + 1] = u[node_idx * 3 + 1]  # u_y
+                u_el[i * 3 + 2] = u[node_idx * 3 + 2]  # u_z
+            
+            # Integrate over element
+            for gp, weight in zip(gauss_points, gauss_weights):
+                xi, eta, zeta = gp
+                
+                # Shape functions and derivatives
+                N, dN_dxi = self._hex8_shape_functions(xi, eta, zeta)
+                
+                # Jacobian
+                J = dN_dxi.T @ el_coors
+                det_J = np.linalg.det(J)
+                
+                if det_J <= 0:
+                    continue
+                
+                # Shape function derivatives in physical coordinates
+                J_inv = np.linalg.inv(J)
+                dN_dx = dN_dxi @ J_inv.T
+                
+                # Build B matrix
+                B = np.zeros((6, 24))
+                for inode in range(8):
+                    idx = inode * 3
+                    dN_dx_i = dN_dx[inode, 0]
+                    dN_dy_i = dN_dx[inode, 1]
+                    dN_dz_i = dN_dx[inode, 2]
+                    
+                    B[0, idx] = dN_dx_i
+                    B[1, idx + 1] = dN_dy_i
+                    B[2, idx + 2] = dN_dz_i
+                    B[3, idx] = dN_dy_i
+                    B[3, idx + 1] = dN_dx_i
+                    B[4, idx] = dN_dz_i
+                    B[4, idx + 2] = dN_dx_i
+                    B[5, idx + 1] = dN_dz_i
+                    B[5, idx + 2] = dN_dy_i
+                
+                # Compute strain: epsilon = B * u_el
+                epsilon = B @ u_el
+                
+                # Weight by volume
+                dV = det_J * weight
+                strain_sum += epsilon * dV
+                volume_sum += dV
+        
+        # Average strain
+        if volume_sum > 0:
+            strain_avg = strain_sum / volume_sum
+        else:
+            strain_avg = np.zeros(6)
+        
+        # Convert to strain tensor (3x3 symmetric)
+        strain_tensor = np.array([
+            [strain_avg[0], strain_avg[3]/2, strain_avg[4]/2],
+            [strain_avg[3]/2, strain_avg[1], strain_avg[5]/2],
+            [strain_avg[4]/2, strain_avg[5]/2, strain_avg[2]]
+        ])
+        
         return strain_tensor
     
     def _compute_stress_from_strain(self, strain_tensor: np.ndarray, damage: np.ndarray) -> float:
-        """Compute stress from strain and damage"""
+        """Compute stress from strain and damage using proper FE formulation
+        
+        For 3D: sigma = D * epsilon (using material matrix)
+        Returns average stress magnitude
+        """
         E_eff = self.material.E * (1.0 - np.mean(damage))
-        stress = E_eff * np.trace(strain_tensor)
-        return stress
+        nu = self.material.nu
+        
+        # Compute Lame parameters
+        lambda_lame = E_eff * nu / ((1 + nu) * (1 - 2 * nu))
+        mu_lame = E_eff / (2 * (1 + nu))
+        
+        # Material matrix
+        D = self._compute_material_matrix(lambda_lame, mu_lame)
+        
+        # Convert strain tensor to vector: [ε_xx, ε_yy, ε_zz, γ_xy, γ_xz, γ_yz]
+        epsilon_vec = np.array([
+            strain_tensor[0, 0],
+            strain_tensor[1, 1],
+            strain_tensor[2, 2],
+            2 * strain_tensor[0, 1],  # Engineering shear strain
+            2 * strain_tensor[0, 2],
+            2 * strain_tensor[1, 2],
+        ])
+        
+        # Compute stress: sigma = D * epsilon
+        sigma_vec = D @ epsilon_vec
+        
+        # Return von Mises stress (or max principal stress)
+        sigma_vm = np.sqrt(
+            0.5 * ((sigma_vec[0] - sigma_vec[1])**2 + 
+                   (sigma_vec[1] - sigma_vec[2])**2 + 
+                   (sigma_vec[2] - sigma_vec[0])**2) +
+            3 * (sigma_vec[3]**2 + sigma_vec[4]**2 + sigma_vec[5]**2)
+        )
+        
+        return sigma_vm
     
     def _compute_results(self) -> Dict:
         """Compute comprehensive summary results from simulation
