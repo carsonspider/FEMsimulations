@@ -45,6 +45,8 @@ def plot_earthquake_results(results: Dict, output_path: Optional[Path] = None,
         ax1.text(0.5, 0.5, f"PGA: {results['pga_g']:.3f} g\n({results['pga']:.2f} m/s²)",
                 ha='center', va='center', transform=ax1.transAxes, fontsize=12)
     else:
+        # Convert to numpy array if it's a list
+        ground_acc = np.array(ground_acc) if not isinstance(ground_acc, np.ndarray) else ground_acc
         ax1.plot(time, ground_acc / 9.81, 'k-', linewidth=1)
     ax1.set_xlabel('Time (s)')
     ax1.set_ylabel('Ground Acceleration (g)')

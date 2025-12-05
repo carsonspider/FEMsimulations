@@ -512,6 +512,11 @@ class EarthquakeSimulator:
                 # Compute stress
                 stress = self._compute_stress_from_strain(strain_tensor, damage)
                 self.stress_history.append(stress)
+                
+                # Store ground acceleration at same frequency for visualization
+                if not hasattr(self, 'ground_acc_history'):
+                    self.ground_acc_history = []
+                self.ground_acc_history.append(u_g_ddot)
             
             # Progress update
             if i % (len(time_array) // 10) == 0:
@@ -803,8 +808,10 @@ Examples:
         damping_ratio=args.damping
     )
     
-    # Add ground motion acceleration to results for visualization
-    results['ground_motion_acceleration'] = ground_motion.acceleration.tolist()
+    # Ground motion acceleration is already in results at output frequency
+    # Also add full time history for reference
+    results['ground_motion_full_time'] = ground_motion.time.tolist()
+    results['ground_motion_full_acceleration'] = ground_motion.acceleration.tolist()
     
     # Save results
     with open(args.output, 'w') as f:
