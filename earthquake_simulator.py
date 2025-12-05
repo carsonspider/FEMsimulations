@@ -341,6 +341,9 @@ class EarthquakeSimulator:
         
         # Compute mass and initial stiffness matrices
         self._initialize_matrices()
+        
+        # Setup boundary conditions (will be done in run_simulation)
+        self._bc_setup = False
     
     def _initialize_matrices(self):
         """Initialize mass, damping, and stiffness matrices"""
@@ -350,12 +353,10 @@ class EarthquakeSimulator:
         # Get number of nodes
         n_nodes = self.domain.mesh.n_nod
         
-        # Lumped mass matrix (diagonal)
-        # Mass = density * volume / n_nodes (simplified)
-        # For proper implementation, integrate shape functions
-        volume = self._estimate_volume()
-        mass_per_node = self.material.rho * volume / n_nodes
-        self.M = np.eye(n_nodes * 3) * mass_per_node  # 3 DOF per node
+        # Mass matrix (consistent or lumped)
+        # For proper implementation: M = ∫ N^T · rho · N dV
+        # Using consistent mass matrix for better accuracy
+        self.M = self._assemble_mass_matrix()
         
         # Initial stiffness matrix (before damage)
         # K = E * geometric_stiffness
@@ -377,40 +378,301 @@ class EarthquakeSimulator:
         print(f"  Stiffness matrix size: {self.K0.shape}")
         print(f"  Damping ratio: {self.sim_params.damping_ratio*100:.1f}%")
     
-    def _estimate_volume(self) -> float:
-        """Estimate structure volume from mesh"""
-        # Simplified: use bounding box volume
-        # For proper implementation, integrate over elements
-        coors = self.domain.mesh.coors
-        bbox_min = coors.min(axis=0)
-        bbox_max = coors.max(axis=0)
-        volume = np.prod(bbox_max - bbox_min)
-        return volume
-    
-    def _assemble_stiffness_matrix(self, damage: Optional[np.ndarray] = None) -> np.ndarray:
-        """Assemble stiffness matrix from FE elements
+    def _assemble_mass_matrix(self) -> np.ndarray:
+        """Assemble consistent mass matrix from FE elements
         
-        TODO: Implement proper FE stiffness matrix assembly
-        For now, returns simplified matrix
+        Implements: M = ∫ N^T · rho · N dV
+        where N = shape function matrix
+        
+        For efficiency, can use lumped mass: M_lumped = diagonal(sum(M_consistent, axis=1))
         """
         n_nodes = self.domain.mesh.n_nod
         n_dof = n_nodes * 3
         
-        # Simplified stiffness matrix
-        # In proper implementation, would assemble from element stiffness matrices:
-        # K_e = ∫ B^T · D · B dV
-        # where B = strain-displacement matrix, D = material matrix
+        # Initialize global mass matrix
+        M = np.zeros((n_dof, n_dof))
         
+        # Get mesh data
+        mesh = self.domain.mesh
+        coors = mesh.coors
+        
+        # Get element connectivity (same as stiffness matrix)
+        if hasattr(mesh, 'conns') and len(mesh.conns) > 0:
+            conn = mesh.conns[0]
+        elif hasattr(mesh, 'get_conn'):
+            try:
+                conn = mesh.get_conn('3_8')
+            except:
+                conn = mesh.get_conn()
+        else:
+            raise ValueError("Cannot access mesh connectivity")
+        
+        # Gauss quadrature
+        gauss_points, gauss_weights = self._get_gauss_quadrature_3d(2)
+        
+        rho = self.material.rho
+        
+        # Process each element
+        for iel, el_conn in enumerate(conn):
+            el_coors = coors[el_conn]
+            
+            # Element mass matrix (24x24)
+            M_e = np.zeros((24, 24))
+            
+            # Integrate over element
+            for gp, weight in zip(gauss_points, gauss_weights):
+                xi, eta, zeta = gp
+                
+                # Shape functions
+                N, dN_dxi = self._hex8_shape_functions(xi, eta, zeta)
+                
+                # Jacobian
+                J = dN_dxi.T @ el_coors
+                det_J = np.linalg.det(J)
+                
+                if det_J <= 0:
+                    continue
+                
+                # Build N matrix for mass (shape functions for each DOF)
+                N_matrix = np.zeros((3, 24))
+                for inode in range(8):
+                    idx = inode * 3
+                    N_matrix[0, idx] = N[inode]
+                    N_matrix[1, idx + 1] = N[inode]
+                    N_matrix[2, idx + 2] = N[inode]
+                
+                # Element mass: M_e += N^T · rho · N · det_J · weight
+                M_e += N_matrix.T @ (rho * np.eye(3)) @ N_matrix * det_J * weight
+            
+            # Assemble into global matrix
+            for i, inode in enumerate(el_conn):
+                for j, jnode in enumerate(el_conn):
+                    i_dof = np.arange(inode * 3, inode * 3 + 3)
+                    j_dof = np.arange(jnode * 3, jnode * 3 + 3)
+                    i_local = np.arange(i * 3, i * 3 + 3)
+                    j_local = np.arange(j * 3, j * 3 + 3)
+                    M[np.ix_(i_dof, j_dof)] += M_e[np.ix_(i_local, j_local)]
+        
+        # Use lumped mass for efficiency (diagonalize)
+        # M_lumped = diagonal(sum(M, axis=1))
+        M_lumped = np.diag(np.sum(M, axis=1))
+        
+        return M_lumped
+    
+    def _assemble_stiffness_matrix(self, damage: Optional[np.ndarray] = None) -> np.ndarray:
+        """Assemble proper FE stiffness matrix from elements
+        
+        Implements: K_e = ∫ B^T · D · B dV
+        where:
+        - B = strain-displacement matrix (shape function gradients)
+        - D = material matrix (elasticity tensor)
+        - Integration over element volume
+        
+        References:
+        - Bathe, K. J. (2014). "Finite Element Procedures." 2nd Edition.
+        - Zienkiewicz, O. C., et al. (2013). "The Finite Element Method." 7th Edition.
+        """
+        
+        n_nodes = self.domain.mesh.n_nod
+        n_dof = n_nodes * 3
+        
+        # Get effective Young's modulus (degraded by damage)
         if damage is None:
             E_eff = self.material.E
+            damage_array = np.zeros(n_nodes)
         else:
-            # Average damage for simplified case
-            E_eff = self.material.E * (1.0 - np.mean(damage))
+            # Use damage at each node (or average if not node-wise)
+            if len(damage) == n_nodes:
+                damage_array = damage
+            else:
+                damage_array = np.full(n_nodes, np.mean(damage))
+            E_eff = self.material.E * (1.0 - damage_array)
         
-        # Simplified: diagonal stiffness (will be replaced with proper FE assembly)
-        K = np.eye(n_dof) * E_eff * 1e6  # Scaling factor (needs proper calibration)
+        # Compute Lame parameters
+        nu = self.material.nu
+        # For isotropic linear elasticity: D matrix components
+        # Using average E_eff for now (in full implementation, would vary by node)
+        E_avg = np.mean(E_eff) if isinstance(E_eff, np.ndarray) else E_eff
+        lambda_lame = E_avg * nu / ((1 + nu) * (1 - 2 * nu))
+        mu_lame = E_avg / (2 * (1 + nu))
+        
+        # Initialize global stiffness matrix
+        K = np.zeros((n_dof, n_dof))
+        
+        # Get mesh data
+        mesh = self.domain.mesh
+        coors = mesh.coors
+        
+        # Get element connectivity
+        # SfePy stores connectivity in mesh.conns (list of arrays, one per element type)
+        # For hexahedral elements (3_8), get the first connectivity array
+        if hasattr(mesh, 'conns') and len(mesh.conns) > 0:
+            conn = mesh.conns[0]  # First element type (should be hexahedra)
+        elif hasattr(mesh, 'get_conn'):
+            try:
+                conn = mesh.get_conn('3_8')
+            except:
+                conn = mesh.get_conn()  # Try without type specification
+        else:
+            raise ValueError("Cannot access mesh connectivity")
+        
+        # Number of integration points (Gauss quadrature)
+        # For hexahedral elements, use 2x2x2 = 8 integration points
+        n_gauss = 2
+        gauss_points, gauss_weights = self._get_gauss_quadrature_3d(n_gauss)
+        
+        # Process each element
+        for iel, el_conn in enumerate(conn):
+            # Get element node coordinates
+            el_coors = coors[el_conn]  # Shape: (8, 3)
+            
+            # Element stiffness matrix (24x24 for 8 nodes × 3 DOF)
+            K_e = np.zeros((24, 24))
+            
+            # Integrate over element using Gauss quadrature
+            for gp, weight in zip(gauss_points, gauss_weights):
+                # Natural coordinates (xi, eta, zeta) in [-1, 1]
+                xi, eta, zeta = gp
+                
+                # Compute shape functions and derivatives at Gauss point
+                N, dN_dxi = self._hex8_shape_functions(xi, eta, zeta)
+                
+                # Compute Jacobian matrix: J = [dx/dxi, dy/dxi, dz/dxi; ...]
+                J = dN_dxi.T @ el_coors  # Shape: (3, 3)
+                det_J = np.linalg.det(J)
+                
+                if det_J <= 0:
+                    continue  # Skip invalid elements
+                
+                # Inverse Jacobian
+                J_inv = np.linalg.inv(J)
+                
+                # Shape function derivatives in physical coordinates
+                dN_dx = dN_dxi @ J_inv.T  # Shape: (8, 3)
+                
+                # Build B matrix (strain-displacement matrix)
+                # For 3D: epsilon = [ε_xx, ε_yy, ε_zz, γ_xy, γ_xz, γ_yz]^T
+                # B relates: epsilon = B * u_e
+                B = np.zeros((6, 24))  # 6 strain components, 24 DOF (8 nodes × 3)
+                
+                for inode in range(8):
+                    # Node DOF indices in element
+                    idx = inode * 3
+                    
+                    # dN/dx, dN/dy, dN/dz
+                    dN_dx_i = dN_dx[inode, 0]
+                    dN_dy_i = dN_dx[inode, 1]
+                    dN_dz_i = dN_dx[inode, 2]
+                    
+                    # Normal strains
+                    B[0, idx] = dN_dx_i      # ε_xx
+                    B[1, idx + 1] = dN_dy_i  # ε_yy
+                    B[2, idx + 2] = dN_dz_i  # ε_zz
+                    
+                    # Shear strains
+                    B[3, idx] = dN_dy_i      # γ_xy
+                    B[3, idx + 1] = dN_dx_i
+                    B[4, idx] = dN_dz_i      # γ_xz
+                    B[4, idx + 2] = dN_dx_i
+                    B[5, idx + 1] = dN_dz_i  # γ_yz
+                    B[5, idx + 2] = dN_dy_i
+                
+                # Material matrix D (for isotropic linear elasticity)
+                D = self._compute_material_matrix(lambda_lame, mu_lame)
+                
+                # Element stiffness contribution: K_e += B^T · D · B · det_J · weight
+                K_e += B.T @ D @ B * det_J * weight
+            
+            # Assemble into global stiffness matrix
+            for i, inode in enumerate(el_conn):
+                for j, jnode in enumerate(el_conn):
+                    # Global DOF indices
+                    i_dof = np.arange(inode * 3, inode * 3 + 3)
+                    j_dof = np.arange(jnode * 3, jnode * 3 + 3)
+                    
+                    # Local DOF indices in element
+                    i_local = np.arange(i * 3, i * 3 + 3)
+                    j_local = np.arange(j * 3, j * 3 + 3)
+                    
+                    # Assemble
+                    K[np.ix_(i_dof, j_dof)] += K_e[np.ix_(i_local, j_local)]
         
         return K
+    
+    def _get_gauss_quadrature_3d(self, n_points: int = 2):
+        """Get Gauss quadrature points and weights for 3D hexahedral elements
+        
+        For n_points=2: 2×2×2 = 8 integration points
+        """
+        # 1D Gauss points and weights
+        if n_points == 2:
+            xi_1d = np.array([-1/np.sqrt(3), 1/np.sqrt(3)])
+            w_1d = np.array([1.0, 1.0])
+        elif n_points == 3:
+            xi_1d = np.array([-np.sqrt(3/5), 0, np.sqrt(3/5)])
+            w_1d = np.array([5/9, 8/9, 5/9])
+        else:
+            # Default to 2-point
+            xi_1d = np.array([-1/np.sqrt(3), 1/np.sqrt(3)])
+            w_1d = np.array([1.0, 1.0])
+        
+        # Generate 3D points (tensor product)
+        points = []
+        weights = []
+        for xi in xi_1d:
+            for eta in xi_1d:
+                for zeta in xi_1d:
+                    points.append([xi, eta, zeta])
+                    weights.append(w_1d[0] * w_1d[0] * w_1d[0])  # Product of 1D weights
+        
+        return np.array(points), np.array(weights)
+    
+    def _hex8_shape_functions(self, xi: float, eta: float, zeta: float):
+        """Shape functions for 8-node hexahedral element
+        
+        Natural coordinates: xi, eta, zeta in [-1, 1]
+        """
+        # Shape functions
+        N = np.array([
+            0.125 * (1 - xi) * (1 - eta) * (1 - zeta),  # Node 0
+            0.125 * (1 + xi) * (1 - eta) * (1 - zeta),  # Node 1
+            0.125 * (1 + xi) * (1 + eta) * (1 - zeta),  # Node 2
+            0.125 * (1 - xi) * (1 + eta) * (1 - zeta),  # Node 3
+            0.125 * (1 - xi) * (1 - eta) * (1 + zeta),  # Node 4
+            0.125 * (1 + xi) * (1 - eta) * (1 + zeta),  # Node 5
+            0.125 * (1 + xi) * (1 + eta) * (1 + zeta),  # Node 6
+            0.125 * (1 - xi) * (1 + eta) * (1 + zeta),  # Node 7
+        ])
+        
+        # Derivatives with respect to natural coordinates
+        dN_dxi = np.array([
+            [-0.125 * (1 - eta) * (1 - zeta), -0.125 * (1 - xi) * (1 - zeta), -0.125 * (1 - xi) * (1 - eta)],
+            [ 0.125 * (1 - eta) * (1 - zeta), -0.125 * (1 + xi) * (1 - zeta), -0.125 * (1 + xi) * (1 - eta)],
+            [ 0.125 * (1 + eta) * (1 - zeta),  0.125 * (1 + xi) * (1 - zeta), -0.125 * (1 + xi) * (1 + eta)],
+            [-0.125 * (1 + eta) * (1 - zeta),  0.125 * (1 - xi) * (1 - zeta), -0.125 * (1 - xi) * (1 + eta)],
+            [-0.125 * (1 - eta) * (1 + zeta), -0.125 * (1 - xi) * (1 + zeta),  0.125 * (1 - xi) * (1 - eta)],
+            [ 0.125 * (1 - eta) * (1 + zeta), -0.125 * (1 + xi) * (1 + zeta),  0.125 * (1 + xi) * (1 - eta)],
+            [ 0.125 * (1 + eta) * (1 + zeta),  0.125 * (1 + xi) * (1 + zeta),  0.125 * (1 + xi) * (1 + eta)],
+            [-0.125 * (1 + eta) * (1 + zeta),  0.125 * (1 - xi) * (1 + zeta),  0.125 * (1 - xi) * (1 + eta)],
+        ])
+        
+        return N, dN_dxi
+    
+    def _compute_material_matrix(self, lambda_lame: float, mu_lame: float) -> np.ndarray:
+        """Compute material matrix D for isotropic linear elasticity
+        
+        For 3D: D relates stress to strain: sigma = D * epsilon
+        epsilon = [ε_xx, ε_yy, ε_zz, γ_xy, γ_xz, γ_yz]^T
+        """
+        D = np.array([
+            [lambda_lame + 2*mu_lame, lambda_lame, lambda_lame, 0, 0, 0],
+            [lambda_lame, lambda_lame + 2*mu_lame, lambda_lame, 0, 0, 0],
+            [lambda_lame, lambda_lame, lambda_lame + 2*mu_lame, 0, 0, 0],
+            [0, 0, 0, mu_lame, 0, 0],
+            [0, 0, 0, 0, mu_lame, 0],
+            [0, 0, 0, 0, 0, mu_lame],
+        ])
+        return D
     
     def run_simulation(self) -> Dict:
         """Run earthquake simulation using Newmark-beta time integration
@@ -470,6 +732,24 @@ class EarthquakeSimulator:
             
             F_eff = F_eff + self.M @ (a0 * u + a2 * u_dot + a3 * u_ddot) + \
                            self.C @ (a1 * u + a4 * u_dot + a5 * u_ddot)
+            
+            # Apply boundary conditions (fix base nodes)
+            # For earthquake simulation, base should be fixed (ground)
+            # Setup boundary conditions if not done
+            if not hasattr(self, '_bc_setup') or not self._bc_setup:
+                self._setup_boundary_conditions()
+            
+            # Partition system for boundary conditions
+            K_eff_bc = K_eff[np.ix_(self.free_dof, self.free_dof)]
+            F_eff_bc = F_eff[self.free_dof]
+            
+            # Solve for free DOF only
+            u_free = np.linalg.solve(K_eff_bc, F_eff_bc)
+            
+            # Reconstruct full displacement vector
+            u_new = np.zeros(n_dof)
+            u_new[self.free_dof] = u_free
+            u_new[self.fixed_dof] = 0.0
             
             # Solve for new displacement
             u_new = np.linalg.solve(K_eff, F_eff)
@@ -532,6 +812,31 @@ class EarthquakeSimulator:
         results = self._compute_results()
         return results
     
+    def _setup_boundary_conditions(self):
+        """Setup boundary conditions (fix base nodes)
+        
+        For earthquake simulation, the base of the structure should be fixed
+        (displacement = 0) since it's attached to the ground.
+        """
+        mesh = self.domain.mesh
+        coors = mesh.coors
+        
+        # Find base nodes (nodes with minimum z-coordinate)
+        z_min = np.min(coors[:, 2])
+        z_tolerance = 1e-6
+        base_nodes = np.where(np.abs(coors[:, 2] - z_min) < z_tolerance)[0]
+        
+        # Fix all DOF for base nodes (u = 0)
+        fixed_dof = []
+        for node in base_nodes:
+            fixed_dof.extend([node * 3, node * 3 + 1, node * 3 + 2])  # x, y, z
+        
+        self.fixed_dof = np.array(fixed_dof, dtype=int)
+        self.free_dof = np.setdiff1d(np.arange(self.M.shape[0]), self.fixed_dof)
+        self._bc_setup = True
+        
+        print(f"  Boundary conditions: {len(base_nodes)} base nodes fixed ({len(self.fixed_dof)} DOF)")
+    
     def _compute_strain_from_displacement(self, u: np.ndarray) -> np.ndarray:
         """Compute average strain tensor from displacement
         
@@ -570,9 +875,24 @@ class EarthquakeSimulator:
         stresses = np.array(self.stress_history) if self.stress_history else None
         
         # Maximum values (absolute)
-        max_displacement = np.max(np.abs(displacements))
-        max_damage = np.max(damages)
-        max_stress = np.max(np.abs(stresses)) if stresses is not None else 0.0
+        # For displacement: compute max across all DOF and time
+        if displacements.ndim == 2:
+            # Shape: (n_time, n_dof) - compute max across all dimensions
+            max_displacement = np.max(np.abs(displacements))
+        else:
+            # If 1D, just take max
+            max_displacement = np.max(np.abs(displacements))
+        
+        max_damage = np.max(damages) if damages.size > 0 else 0.0
+        
+        if stresses is not None:
+            if isinstance(stresses, np.ndarray):
+                max_stress = np.max(np.abs(stresses))
+            else:
+                # If list of scalars
+                max_stress = np.max(np.abs(np.array(stresses)))
+        else:
+            max_stress = 0.0
         
         # Residual (final) values
         residual_displacement = np.abs(displacements[-1])
@@ -580,8 +900,21 @@ class EarthquakeSimulator:
         residual_stress = np.abs(stresses[-1]) if stresses is not None else 0.0
         
         # Peak response
-        peak_acceleration = np.max(np.abs(accelerations)) if accelerations is not None else 0.0
-        peak_velocity = np.max(np.abs(velocities)) if velocities is not None else 0.0
+        if accelerations is not None:
+            if isinstance(accelerations, np.ndarray):
+                peak_acceleration = np.max(np.abs(accelerations))
+            else:
+                peak_acceleration = np.max(np.abs(np.array(accelerations)))
+        else:
+            peak_acceleration = 0.0
+            
+        if velocities is not None:
+            if isinstance(velocities, np.ndarray):
+                peak_velocity = np.max(np.abs(velocities))
+            else:
+                peak_velocity = np.max(np.abs(np.array(velocities)))
+        else:
+            peak_velocity = 0.0
         
         # Inter-story drift (for multi-story structures, simplified here)
         # For single structure, use maximum relative displacement
