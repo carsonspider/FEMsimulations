@@ -36,9 +36,9 @@ from scipy import ndimage
 from skimage import measure
 from stl import mesh
 
-# Import base functions from active_gyroid_gen
-from active_gyroid_gen import (
-    GyroidParameters,
+# Import from lib modules
+from .parameters import GyroidParameters
+from .tpms_helpers import (
     validate_params,
     compute_domain_lengths,
     generate_coordinate_grid,
@@ -46,7 +46,6 @@ from active_gyroid_gen import (
     add_bounding_box,
     marching_cubes_mesh,
     export_stl,
-    visualise,
     solve_layer_threshold,
 )
 
@@ -502,8 +501,6 @@ def visualise_radial_gradient(
 
 def main():
     """Example usage of radial gradient gyroid generator."""
-    from active_gyroid_gen import DEFAULT_PARAMS
-    
     # Create base parameters
     base_params = GyroidParameters(
         numx=5,
