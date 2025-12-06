@@ -21,6 +21,8 @@ Outputs:
 - Displacement field visualization
 - Energy absorption
 - Damage field (microcracking)
+
+python mazars_model_sfepy.py <stl_file> [options]
 """
 
 import numpy as np
@@ -87,7 +89,7 @@ class MaterialProperties:
     A_c: float = 1.0  # Mazars compressive damage evolution parameter 1 - Recommended: 0.7-1.5
     B_c: float = 1500.0  # Mazars compressive damage evolution parameter 2 - Recommended: 1000-2000
     # Tensile damage parameters (tensile strength is ~10-15% of compressive strength)
-    epsilon_t0: float =  8e-5   # Mazars tensile damage threshold strain (ε_d0) - much lower than compression
+    epsilon_t0: float =  5e-5   # Mazars tensile damage threshold strain (ε_d0) - much lower than compression
     A_t: float = 0.7  # Mazars tensile damage evolution parameter 1 - lower than compression
     B_t: float = 2000.0  # Mazars tensile damage evolution parameter 2 - higher for faster damage
     
@@ -121,7 +123,7 @@ class SimulationParameters:
     fair comparison of failure strengths based on internal geometry differences.
     """
     
-    max_force: float = 3500.0  # N (Fixed force for all geometries - targets ~35 MPa for 10mm structures)
+    max_force: float = 2000.0  # N (Fixed force for all geometries - targets ~35 MPa for 10mm structures)
     target_stress_mpa: float = 35.0  # Target maximum stress in MPa (used only if max_force is None for auto-calculation)
     num_steps: int = 10  # Full simulation with 10 steps
     element_size: float = 0.05  # m (balanced for speed/accuracy)
@@ -151,10 +153,49 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         import meshio
         
         # Read STL to get bounding box
-        stl_mesh = meshio.read(str(stl_path), file_format="stl")
-        points = stl_mesh.points
+        # meshio automatically handles both ASCII and binary STL files
+        try:
+            stl_mesh = meshio.read(str(stl_path), file_format="stl")
+            points = stl_mesh.points
+        except (UnicodeDecodeError, ValueError, Exception) as e:
+            # If meshio fails (encoding issue or other), fall back to numpy-stl
+            print(f"Warning: meshio read failed ({type(e).__name__}), trying alternative method...")
+            try:
+                from stl import mesh as stl_mesh_module
+                stl_mesh_stl = stl_mesh_module.Mesh.from_file(str(stl_path))
+                # Extract unique vertices from STL triangles
+                points = np.unique(stl_mesh_stl.vectors.reshape(-1, 3), axis=0)
+                print(f"Successfully loaded STL using numpy-stl: {len(points)} unique vertices")
+            except Exception as e2:
+                raise RuntimeError(
+                    f"Failed to read STL file with both meshio and numpy-stl.\n"
+                    f"  meshio error: {e}\n"
+                    f"  numpy-stl error: {e2}\n"
+                    f"  File: {stl_path}"
+                )
+        
+        # Validate points
+        if points is None or len(points) == 0:
+            raise ValueError(f"STL file contains no points: {stl_path}")
+        
+        # Check for NaN or Inf values
+        if np.any(np.isnan(points)) or np.any(np.isinf(points)):
+            raise ValueError(
+                f"STL file contains invalid coordinates (NaN or Inf): {stl_path}\n"
+                f"  This may indicate a corrupted or invalid STL file."
+            )
+        
         bbox_min = points.min(axis=0)
         bbox_max = points.max(axis=0)
+        
+        # Validate bounding box
+        if np.any(np.isnan(bbox_min)) or np.any(np.isnan(bbox_max)):
+            raise ValueError(
+                f"Invalid bounding box computed from STL file: {stl_path}\n"
+                f"  bbox_min: {bbox_min}\n"
+                f"  bbox_max: {bbox_max}\n"
+                f"  This may indicate the STL file has invalid geometry."
+            )
         
         # Auto-detect units: if max dimension > 10, assume mm and convert to m
         max_dim = np.max(bbox_max - bbox_min)
@@ -172,9 +213,38 @@ def load_stl_and_create_mesh(stl_path: Path, element_size: float):
         
         # For SfePy, create a box mesh using meshio and convert to SfePy format
         size = bbox_max - bbox_min
-        n_x = max(2, int(size[0] / element_size))
-        n_y = max(2, int(size[1] / element_size))
-        n_z = max(2, int(size[2] / element_size))
+        
+        # Validate size before converting to integers
+        if np.any(np.isnan(size)) or np.any(np.isinf(size)):
+            raise ValueError(
+                f"Invalid mesh size computed from STL file: {stl_path}\n"
+                f"  size: {size}\n"
+                f"  bbox_min: {bbox_min}\n"
+                f"  bbox_max: {bbox_max}\n"
+                f"  This may indicate the STL file has invalid geometry."
+            )
+        
+        # Check for zero or negative dimensions
+        if np.any(size <= 0):
+            raise ValueError(
+                f"STL file has zero or negative dimensions: {stl_path}\n"
+                f"  size: {size}\n"
+                f"  bbox_min: {bbox_min}\n"
+                f"  bbox_max: {bbox_max}"
+            )
+        
+        # Calculate number of divisions, ensuring we get valid integers
+        n_x = max(2, int(np.round(size[0] / element_size)))
+        n_y = max(2, int(np.round(size[1] / element_size)))
+        n_z = max(2, int(np.round(size[2] / element_size)))
+        
+        # Final validation
+        if np.isnan(n_x) or np.isnan(n_y) or np.isnan(n_z):
+            raise ValueError(
+                f"Failed to compute valid mesh divisions: n_x={n_x}, n_y={n_y}, n_z={n_z}\n"
+                f"  size: {size}\n"
+                f"  element_size: {element_size}"
+            )
         
         print(f"Creating box mesh: {n_x}x{n_y}x{n_z} divisions")
         print(f"Bounding box: {bbox_min} to {bbox_max} (m)")
@@ -346,13 +416,157 @@ def compute_stress_from_strain(epsilon_tensor: np.ndarray, damage: float,
     return stress
 
 
+def _get_gauss_quadrature_3d(n_points: int = 2):
+    """Get Gauss quadrature points and weights for 3D hexahedral elements."""
+    if n_points == 2:
+        xi_1d = np.array([-1/np.sqrt(3), 1/np.sqrt(3)])
+        w_1d = np.array([1.0, 1.0])
+    elif n_points == 3:
+        xi_1d = np.array([-np.sqrt(3/5), 0, np.sqrt(3/5)])
+        w_1d = np.array([5/9, 8/9, 5/9])
+    else:
+        xi_1d = np.array([-1/np.sqrt(3), 1/np.sqrt(3)])
+        w_1d = np.array([1.0, 1.0])
+    
+    points, weights = [], []
+    for i, xi in enumerate(xi_1d):
+        for j, eta in enumerate(xi_1d):
+            for k, zeta in enumerate(xi_1d):
+                points.append([xi, eta, zeta])
+                weights.append(w_1d[i] * w_1d[j] * w_1d[k])
+    return np.array(points), np.array(weights)
+
+
+def _hex8_shape_functions(xi: float, eta: float, zeta: float):
+    """Shape functions for 8-node hexahedral element."""
+    N = np.array([
+        0.125 * (1 - xi) * (1 - eta) * (1 - zeta),
+        0.125 * (1 + xi) * (1 - eta) * (1 - zeta),
+        0.125 * (1 + xi) * (1 + eta) * (1 - zeta),
+        0.125 * (1 - xi) * (1 + eta) * (1 - zeta),
+        0.125 * (1 - xi) * (1 - eta) * (1 + zeta),
+        0.125 * (1 + xi) * (1 - eta) * (1 + zeta),
+        0.125 * (1 + xi) * (1 + eta) * (1 + zeta),
+        0.125 * (1 - xi) * (1 + eta) * (1 + zeta),
+    ])
+    dN_dxi = np.array([
+        [-0.125 * (1 - eta) * (1 - zeta), -0.125 * (1 - xi) * (1 - zeta), -0.125 * (1 - xi) * (1 - eta)],
+        [ 0.125 * (1 - eta) * (1 - zeta), -0.125 * (1 + xi) * (1 - zeta), -0.125 * (1 + xi) * (1 - eta)],
+        [ 0.125 * (1 + eta) * (1 - zeta),  0.125 * (1 + xi) * (1 - zeta), -0.125 * (1 + xi) * (1 + eta)],
+        [-0.125 * (1 + eta) * (1 - zeta),  0.125 * (1 - xi) * (1 - zeta), -0.125 * (1 - xi) * (1 + eta)],
+        [-0.125 * (1 - eta) * (1 + zeta), -0.125 * (1 - xi) * (1 + zeta),  0.125 * (1 - xi) * (1 - eta)],
+        [ 0.125 * (1 - eta) * (1 + zeta), -0.125 * (1 + xi) * (1 + zeta),  0.125 * (1 + xi) * (1 - eta)],
+        [ 0.125 * (1 + eta) * (1 + zeta),  0.125 * (1 + xi) * (1 + zeta),  0.125 * (1 + xi) * (1 + eta)],
+        [-0.125 * (1 + eta) * (1 + zeta),  0.125 * (1 - xi) * (1 + zeta),  0.125 * (1 - xi) * (1 + eta)],
+    ])
+    return N, dN_dxi
+
+
+def _compute_material_matrix(lambda_lame: float, mu_lame: float) -> np.ndarray:
+    """Compute 3D isotropic elasticity matrix D."""
+    D = np.array([
+        [lambda_lame + 2*mu_lame, lambda_lame, lambda_lame, 0, 0, 0],
+        [lambda_lame, lambda_lame + 2*mu_lame, lambda_lame, 0, 0, 0],
+        [lambda_lame, lambda_lame, lambda_lame + 2*mu_lame, 0, 0, 0],
+        [0, 0, 0, mu_lame, 0, 0],
+        [0, 0, 0, 0, mu_lame, 0],
+        [0, 0, 0, 0, 0, mu_lame],
+    ])
+    return D
+
+
+def assemble_stiffness_matrix(mesh, coords, damage: np.ndarray, material: MaterialProperties) -> np.ndarray:
+    """Assemble global stiffness matrix K with damage-dependent moduli.
+    
+    Implements: K = Σ K_e where K_e = ∫ B^T · D · B dV
+    """
+    n_nodes = len(coords)
+    n_dof = n_nodes * 3
+    
+    # Compute effective modulus at each node
+    E_eff = material.E * (1.0 - damage)
+    E_eff = np.maximum(E_eff, material.E * 0.01)
+    
+    # Get connectivity
+    if hasattr(mesh, 'conns') and len(mesh.conns) > 0:
+        conn = mesh.conns[0]
+    elif hasattr(mesh, 'get_conn'):
+        try:
+            conn = mesh.get_conn('3_8')
+        except:
+            conn = mesh.get_conn()
+    else:
+        raise ValueError("Cannot access mesh connectivity")
+    
+    # Initialize global stiffness matrix
+    K = np.zeros((n_dof, n_dof))
+    
+    # Gauss quadrature (2x2x2 = 8 points)
+    gauss_points, gauss_weights = _get_gauss_quadrature_3d(2)
+    
+    # Process each element
+    for iel, el_conn in enumerate(conn):
+        el_coors = coords[el_conn]
+        
+        # Average E_eff for element (could be improved with integration point values)
+        el_E_eff = np.mean(E_eff[el_conn])
+        nu = material.nu
+        lambda_lame = el_E_eff * nu / ((1 + nu) * (1 - 2 * nu))
+        mu_lame = el_E_eff / (2 * (1 + nu))
+        D = _compute_material_matrix(lambda_lame, mu_lame)
+        
+        K_e = np.zeros((24, 24))
+        
+        # Integrate over element
+        for gp, weight in zip(gauss_points, gauss_weights):
+            xi, eta, zeta = gp
+            N, dN_dxi = _hex8_shape_functions(xi, eta, zeta)
+            
+            # Jacobian
+            J = dN_dxi.T @ el_coors
+            det_J = np.linalg.det(J)
+            if det_J <= 0:
+                continue
+            
+            J_inv = np.linalg.inv(J)
+            dN_dx = dN_dxi @ J_inv.T
+            
+            # Build B matrix (strain-displacement)
+            B = np.zeros((6, 24))
+            for inode in range(8):
+                idx = inode * 3
+                dN_dx_i, dN_dy_i, dN_dz_i = dN_dx[inode, 0], dN_dx[inode, 1], dN_dx[inode, 2]
+                
+                B[0, idx] = dN_dx_i      # ε_xx
+                B[1, idx + 1] = dN_dy_i  # ε_yy
+                B[2, idx + 2] = dN_dz_i  # ε_zz
+                B[3, idx] = dN_dy_i      # γ_xy
+                B[3, idx + 1] = dN_dx_i
+                B[4, idx] = dN_dz_i      # γ_xz
+                B[4, idx + 2] = dN_dx_i
+                B[5, idx + 1] = dN_dz_i  # γ_yz
+                B[5, idx + 2] = dN_dy_i
+            
+            K_e += B.T @ D @ B * det_J * weight
+        
+        # Assemble into global matrix
+        for i, inode in enumerate(el_conn):
+            for j, jnode in enumerate(el_conn):
+                i_dof = np.arange(inode * 3, inode * 3 + 3)
+                j_dof = np.arange(jnode * 3, jnode * 3 + 3)
+                i_local = np.arange(i * 3, i * 3 + 3)
+                j_local = np.arange(j * 3, j * 3 + 3)
+                K[np.ix_(i_dof, j_dof)] += K_e[np.ix_(i_local, j_local)]
+    
+    return K
+
+
 def solve_fe_system_with_damage(mesh, coords, damage: np.ndarray, 
                                 current_traction: float, z_min: float, z_max: float,
                                 material: MaterialProperties, tension: bool = False) -> np.ndarray:
-    """Solve FE system K(D)·u = F with damage-dependent stiffness.
+    """Solve FE system K(D)·u = F with damage-dependent stiffness and proper boundary conditions.
     
-    This implements a simplified but spatially-varying FE solve that accounts
-    for damage localization. Uses direct matrix assembly for hexahedral elements.
+    Properly assembles stiffness matrix, enforces boundary conditions, and solves K(D)·u = F.
     
     Parameters
     ----------
@@ -370,6 +584,8 @@ def solve_fe_system_with_damage(mesh, coords, damage: np.ndarray,
         Maximum z coordinate (top)
     material : MaterialProperties
         Material properties
+    tension : bool
+        If True, apply tensile loading; if False, compressive
     
     Returns
     -------
@@ -377,114 +593,87 @@ def solve_fe_system_with_damage(mesh, coords, damage: np.ndarray,
         Displacement field at all nodes
     """
     n_nodes = len(coords)
+    n_dof = n_nodes * 3
     
-    # Compute effective modulus at each node
-    E_eff = material.E * (1.0 - damage)
-    E_eff = np.maximum(E_eff, material.E * 0.01)  # Prevent singularity
+    # Assemble global stiffness matrix with damage
+    K = assemble_stiffness_matrix(mesh, coords, damage, material)
     
-    # Compute Lame parameters
-    nu = material.nu
-    mu_eff = E_eff / (2.0 * (1.0 + nu))
-    lmbda_eff = E_eff * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    # Assemble force vector
+    F = np.zeros(n_dof)
     
-    # Initialize displacement field (3D vector at each node)
-    u = np.zeros((n_nodes, 3), dtype=np.float64)
+    # Apply traction on top surface
+    top_nodes = np.where(coords[:, 2] >= z_max - 1e-6)[0]
+    bottom_nodes = np.where(coords[:, 2] <= z_min + 1e-6)[0]
     
-    # Get connectivity
-    conns = mesh.conns[0] if isinstance(mesh.conns, list) else mesh.conns
-    n_elements = len(conns)
-    
-    # For each element, compute contribution to displacement
-    # Use simplified approach: compute average strain in element
-    element_strains = []
-    
-    for el_idx, element_nodes in enumerate(conns):
-        # Get element coordinates and effective moduli
-        el_coords = coords[element_nodes]
-        el_E_eff = np.mean(E_eff[element_nodes])
-        el_damage = np.mean(damage[element_nodes])
+    # Calculate area of top surface (approximate from node spacing)
+    if len(top_nodes) > 0:
+        top_coords = coords[top_nodes]
+        x_range = np.max(top_coords[:, 0]) - np.min(top_coords[:, 0])
+        y_range = np.max(top_coords[:, 1]) - np.min(top_coords[:, 1])
+        top_area = x_range * y_range
+        if top_area < 1e-10:
+            # Fallback: estimate from all nodes
+            x_range = np.max(coords[:, 0]) - np.min(coords[:, 0])
+            y_range = np.max(coords[:, 1]) - np.min(coords[:, 1])
+            top_area = x_range * y_range
         
-        # Compute element size
-        el_size = np.max(el_coords, axis=0) - np.min(el_coords, axis=0)
-        el_volume = np.prod(el_size)
+        # Force per node on top surface
+        force_per_node = current_traction * top_area / len(top_nodes) if len(top_nodes) > 0 else 0.0
         
-        if el_volume < 1e-12:
-            continue
-        
-        # Compute element center z coordinate
-        el_center_z = np.mean(el_coords[:, 2])
-        
-        # Compute expected strain based on position and damage
-        # Higher damage = higher strain for same stress
-        strain_factor = 1.0 / (1.0 - el_damage) if el_damage < 0.99 else 10.0
-        
-        # Compute strain from traction (negative for compression, positive for tension)
-        strain_magnitude = abs(current_traction) / el_E_eff * strain_factor
-        if tension:
-            strain_zz = strain_magnitude  # Positive for tension
+        # Apply force in z-direction (negative for compression, positive for tension)
+        for node in top_nodes:
+            if tension:
+                F[node * 3 + 2] = force_per_node  # Positive z (tension)
+            else:
+                F[node * 3 + 2] = -force_per_node  # Negative z (compression)
+    
+    # Apply boundary conditions: u = 0 at bottom surface
+    # Use penalty method or direct elimination
+    # Direct elimination: remove DOFs at bottom
+    free_dofs = []
+    fixed_dofs = []
+    
+    for node in range(n_nodes):
+        if node in bottom_nodes:
+            # Fix all DOFs at bottom
+            fixed_dofs.extend([node * 3, node * 3 + 1, node * 3 + 2])
         else:
-            strain_zz = -strain_magnitude  # Negative for compression
-        
-        # Account for Poisson effect
-        strain_xx = -nu * strain_zz
-        strain_yy = -nu * strain_zz
-        
-        # Store element strain
-        element_strains.append({
-            'nodes': element_nodes,
-            'strain_zz': strain_zz,
-            'strain_xx': strain_xx,
-            'strain_yy': strain_yy,
-            'center_z': el_center_z
-        })
+            free_dofs.extend([node * 3, node * 3 + 1, node * 3 + 2])
     
-    # Compute displacement at each node from element strains
-    # Displacement = integral of strain along loading direction
-    for node_idx in range(n_nodes):
-        node_coord = coords[node_idx]
-        node_z = node_coord[2]
-        
-        # Find elements connected to this node
-        connected_elements = []
-        for el_data in element_strains:
-            if node_idx in el_data['nodes']:
-                connected_elements.append(el_data)
-        
-        if len(connected_elements) == 0:
-            continue
-        
-        # Compute weighted average strain
-        total_weight = 0.0
-        avg_strain_zz = 0.0
-        
-        for el_data in connected_elements:
-            # Weight by distance from node to element center
-            el_nodes = el_data['nodes']
-            el_coords_el = coords[el_nodes]
-            el_center = np.mean(el_coords_el, axis=0)
-            dist = np.linalg.norm(node_coord - el_center)
-            weight = 1.0 / (dist + 1e-6)
-            
-            avg_strain_zz += el_data['strain_zz'] * weight
-            total_weight += weight
-        
-        if total_weight > 1e-10:
-            avg_strain_zz /= total_weight
-        
-        # Compute displacement: u_z = strain_zz * (z - z_bottom)
-        # Displacement is relative to bottom surface
-        u[node_idx, 2] = avg_strain_zz * (node_z - z_min)
-        
-        # Lateral displacements from Poisson effect
-        avg_strain_xx = -nu * avg_strain_zz
-        avg_strain_yy = -nu * avg_strain_zz
-        
-        # Estimate lateral displacement based on distance from center
-        center_x = (np.max(coords[:, 0]) + np.min(coords[:, 0])) / 2.0
-        center_y = (np.max(coords[:, 1]) + np.min(coords[:, 1])) / 2.0
-        
-        u[node_idx, 0] = avg_strain_xx * (node_coord[0] - center_x)
-        u[node_idx, 1] = avg_strain_yy * (node_coord[1] - center_y)
+    # Reorder: free DOFs first, then fixed
+    all_dofs = free_dofs + fixed_dofs
+    n_free = len(free_dofs)
+    
+    # Reorder K and F
+    K_reordered = K[np.ix_(all_dofs, all_dofs)]
+    F_reordered = F[all_dofs]
+    
+    # Extract free-free submatrix and free force vector
+    K_ff = K_reordered[:n_free, :n_free]
+    F_f = F_reordered[:n_free]
+    
+    # Solve for free DOFs: K_ff · u_f = F_f
+    try:
+        from scipy.sparse import csc_matrix
+        from scipy.sparse.linalg import spsolve
+        K_ff_sparse = csc_matrix(K_ff)
+        u_f = spsolve(K_ff_sparse, F_f)
+    except:
+        # Fallback to dense solve
+        u_f = np.linalg.solve(K_ff, F_f)
+    
+    # Reconstruct full displacement vector
+    u_full = np.zeros(n_dof)
+    u_full[:n_free] = u_f
+    # Fixed DOFs remain zero (already initialized)
+    
+    # Reorder back to original DOF ordering
+    u_original = np.zeros(n_dof)
+    for i, dof in enumerate(all_dofs):
+        u_original[dof] = u_full[i]
+    
+    # Reshape to (n_nodes, 3)
+    u = u_original.reshape(n_nodes, 3)
     
     return u
 
@@ -526,10 +715,10 @@ def compute_equivalent_strain(epsilon_tensor: np.ndarray) -> float:
 
 def compute_strain_tensor_from_displacement(u_field: np.ndarray, node_idx: int, mesh, 
                                            coords: np.ndarray) -> np.ndarray:
-    """Compute full 3D strain tensor from displacement field at a node.
+    """Compute full 3D strain tensor from displacement field at a node using proper FE shape function derivatives.
     
-    This function computes ε = 0.5(∇u + ∇u^T) at a given node using finite difference
-    approximation over neighboring elements. This provides proper spatial variation.
+    Uses proper FE shape function gradients: ε = 0.5(∇u + ∇u^T) where ∇u is computed
+    from shape function derivatives at the node location.
     
     Parameters
     ----------
@@ -551,71 +740,69 @@ def compute_strain_tensor_from_displacement(u_field: np.ndarray, node_idx: int, 
     node_coord = coords[node_idx]
     
     # Find elements connected to this node
-    conns = mesh.conns[0] if isinstance(mesh.conns, list) else mesh.conns
+    if hasattr(mesh, 'conns') and len(mesh.conns) > 0:
+        conns = mesh.conns[0]
+    elif hasattr(mesh, 'get_conn'):
+        try:
+            conns = mesh.get_conn('3_8')
+        except:
+            conns = mesh.get_conn()
+    else:
+        raise ValueError("Cannot access mesh connectivity")
+    
     connected_elements = []
     for el_idx, element_nodes in enumerate(conns):
         if node_idx in element_nodes:
             connected_elements.append((el_idx, element_nodes))
     
     if len(connected_elements) == 0:
-        # Node not in any element, return zero tensor
         return np.zeros((3, 3), dtype=np.float64)
     
-    # Compute gradient using weighted average over connected elements
+    # Compute strain using proper FE shape function derivatives
     strain_tensors = []
     
     for el_idx, element_nodes in connected_elements:
-        # Get element node coordinates and displacements
         el_coords = coords[element_nodes]
         el_displacements = u_field[element_nodes]
         
-        # Compute element center
-        el_center = np.mean(el_coords, axis=0)
+        # Find local node index in element
+        local_node_idx = np.where(element_nodes == node_idx)[0]
+        if len(local_node_idx) == 0:
+            continue
+        local_node_idx = local_node_idx[0]
         
-        # Compute relative positions from node to element center
-        dx = el_center - node_coord
-        dist = np.linalg.norm(dx)
+        # Get natural coordinates of this node in element
+        # For hex8, nodes are at corners: xi, eta, zeta = ±1
+        # Node 0: (-1, -1, -1), Node 1: (1, -1, -1), etc.
+        corner_coords = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)
+        ]
+        xi, eta, zeta = corner_coords[local_node_idx]
         
-        if dist < 1e-10:
-            dist = 1e-10  # Avoid division by zero
+        # Get shape function derivatives at this node
+        _, dN_dxi = _hex8_shape_functions(xi, eta, zeta)
         
-        # Compute approximate gradient using central difference
-        # For hexahedral elements, use element size as characteristic length
-        element_size = np.max(el_coords, axis=0) - np.min(el_coords, axis=0)
-        char_length = np.max(element_size)
-        
-        if char_length < 1e-10:
+        # Compute Jacobian at node
+        J = dN_dxi.T @ el_coords
+        det_J = np.linalg.det(J)
+        if det_J <= 1e-10:
             continue
         
-        # Compute displacement gradient components
-        grad_u = np.zeros((3, 3), dtype=np.float64)
+        J_inv = np.linalg.inv(J)
+        dN_dx = dN_dxi @ J_inv.T  # Shape function derivatives in physical coordinates
         
-        # Get displacement at node
-        u_node = u_field[node_idx]
-        
-        # Compute gradient using displacement differences
-        for i in range(3):  # x, y, z directions
-            for j in range(3):  # displacement components
-                # Average gradient over connected nodes in element
-                u_vals = el_displacements[:, j]
-                coord_vals = el_coords[:, i]
-                
-                # Compute gradient using linear fit over element
-                if len(u_vals) > 1:
-                    # Use linear regression over element
-                    A = np.column_stack([coord_vals - node_coord[i], np.ones(len(coord_vals))])
-                    try:
-                        coeffs = np.linalg.lstsq(A, u_vals - u_node[j], rcond=None)[0]
-                        grad_u[j, i] = coeffs[0] if len(coeffs) > 0 else 0.0
-                    except:
-                        # Fallback: simple difference
-                        grad_u[j, i] = 0.0
+        # Compute displacement gradient: ∇u = Σ (dN_i/dx) · u_i
+        grad_u = np.zeros((3, 3))
+        for i, node in enumerate(element_nodes):
+            u_node = u_field[node]
+            grad_u += np.outer(u_node, dN_dx[i])
         
         # Compute symmetric strain tensor: ε = 0.5(∇u + ∇u^T)
         strain_tensor = 0.5 * (grad_u + grad_u.T)
         
-        # Weight by inverse distance
-        weight = 1.0 / (dist + char_length)
+        # Weight by element volume (det_J)
+        weight = det_J
         strain_tensors.append((strain_tensor, weight))
     
     if len(strain_tensors) == 0:
@@ -858,6 +1045,12 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
     damage_history = []
     convergence_info = []
     
+    # Track when damage first occurs
+    damage_first_detected = False
+    damage_first_step = None
+    damage_first_force = None
+    damage_first_stress = None
+    
     print(f"Running {sim_params.num_steps} load steps with damage iterations...")
     print(f"  Mesh: {n_nodes} nodes, {mesh.n_el} elements")
     print(f"  Damage tolerance: {sim_params.damage_tol:.2e}")
@@ -984,8 +1177,12 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
             stresses_nodes.append(stress_zz_node)
             strains_zz_nodes.append(strain_zz_node)
         
-        # Average over nodes (volume-weighted average would be better, but node average is reasonable)
-        stress_avg = np.mean(stresses_nodes)
+        # Average over nodes
+        # Use COMPUTED stress from FE solution (reflects actual material response with damage)
+        stress_avg = abs(np.mean([s for s in stresses_nodes if not np.isnan(s)]))  # Computed stress in Pa
+        if np.isnan(stress_avg) or stress_avg == 0:
+            # Fallback to applied stress if computed stress is invalid
+            stress_avg = abs(current_traction)
         strain_avg = abs(np.mean(strains_zz_nodes))
         
         # Compute displacement from displacement field
@@ -997,34 +1194,50 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
             displacement_avg = abs(np.max(u_field[:, 2]))
         
         # Energy: U = 0.5 * ∫ σ : ε dV
-        # Approximate by summing over nodes
+        # Use computed stress tensor for accurate energy calculation
         volume = cross_sectional_area * (z_max - z_min)
         volume_per_node = volume / n_nodes if n_nodes > 0 else 0.0
         
         energy = 0.0
         for node_idx in range(n_nodes):
             epsilon_tensor_node = epsilon_tensors_final[node_idx]
+            damage_node = damage[node_idx]
+            
+            # Compute stress tensor from strain and damage
             stress_tensor_node = compute_stress_from_strain(
-                epsilon_tensor_node, damage[node_idx], material
+                epsilon_tensor_node, damage_node, material
             )
-            # Energy density: 0.5 * σ : ε
-            energy_density = 0.5 * np.sum(stress_tensor_node * epsilon_tensor_node)
+            
+            # Energy density: E = 0.5 * trace(σ · ε) = 0.5 * σ_ij · ε_ij
+            energy_density = 0.5 * np.trace(stress_tensor_node @ epsilon_tensor_node)
             energy += energy_density * volume_per_node
         
         energy = abs(energy)  # Store as positive value
         
         strains.append(float(strain_avg))
-        stresses.append(float(abs(stress_avg)))  # Store as positive (compressive strength)
+        stresses.append(float(abs(stress_avg)))  # Store as positive (compressive strength) - now using applied stress
         energies.append(float(energy))
         displacements.append(float(displacement_avg))
         forces.append(float(current_force))
-        damage_history.append(float(np.mean(damage)))
+        damage_avg = float(np.mean(damage))
+        damage_history.append(damage_avg)
         convergence_info.append({
             "damage_iterations": damage_iter + 1,
             "converged": converged,
             "damage_max": float(np.max(damage)),
-            "damage_avg": float(np.mean(damage))
+            "damage_avg": damage_avg
         })
+        
+        # Check if damage first occurred in this step
+        if not damage_first_detected and damage_avg > 1e-6:  # Small threshold to detect first damage
+            damage_first_detected = True
+            damage_first_step = step + 1
+            damage_first_force = current_force
+            damage_first_stress = abs(stress_avg)
+            print(f"\n    ⚠ DAMAGE FIRST DETECTED at Step {damage_first_step}/{sim_params.num_steps}")
+            print(f"       Force: {damage_first_force/1e3:.2f} kN ({damage_first_force:.0f} N)")
+            print(f"       Stress: {damage_first_stress/1e6:.2f} MPa")
+            print(f"       Average damage: {damage_avg:.6f}, Max damage: {np.max(damage):.6f}\n")
         
         if step % max(1, sim_params.num_steps // 5) == 0 or step == sim_params.num_steps - 1:
             status = "✓" if converged else "⚠"
@@ -1070,6 +1283,15 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
     max_energy = max(energies) if energies else 0.0
     max_force = max(forces) if forces else 0.0
     
+    # Print summary of damage initiation
+    if damage_first_detected:
+        print(f"\n  Damage Initiation Summary (Compression):")
+        print(f"    First damage detected at Step {damage_first_step}/{sim_params.num_steps}")
+        print(f"    Force at damage initiation: {damage_first_force/1e3:.2f} kN ({damage_first_force:.0f} N)")
+        print(f"    Stress at damage initiation: {damage_first_stress/1e6:.2f} MPa")
+    else:
+        print(f"\n  No damage detected during compression test (all steps completed without damage)")
+    
     return {
         "strains": strains,
         "stresses": stresses,
@@ -1083,6 +1305,9 @@ def run_compression_test(domain, material: MaterialProperties, sim_params: Simul
         "cross_sectional_area_m2": cross_sectional_area,
         "total_energy_absorption": max_energy,
         "mesh": domain,  # Return domain for compatibility
+        "damage_first_step": damage_first_step,
+        "damage_first_force_N": damage_first_force,
+        "damage_first_stress_Pa": damage_first_stress,
     }
 
 
@@ -1185,6 +1410,12 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
     strains, stresses, energies, displacements, forces = [], [], [], [], []
     damage_history = []
     convergence_info = []
+    
+    # Track when damage first occurs
+    damage_first_detected = False
+    damage_first_step = None
+    damage_first_force = None
+    damage_first_stress = None
     
     print(f"Running {sim_params.num_steps} load steps with damage iterations...")
     print(f"  Mesh: {n_nodes} nodes, {mesh.n_el} elements")
@@ -1293,7 +1524,11 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
             strains_zz_nodes.append(strain_zz_node)
         
         # Average over nodes
-        stress_avg = np.mean(stresses_nodes)
+        # Use COMPUTED stress from FE solution (reflects actual material response with damage)
+        stress_avg = abs(np.mean([s for s in stresses_nodes if not np.isnan(s)]))  # Computed stress in Pa
+        if np.isnan(stress_avg) or stress_avg == 0:
+            # Fallback to applied stress if computed stress is invalid
+            stress_avg = abs(current_traction)
         strain_avg = abs(np.mean(strains_zz_nodes))
         
         # Compute displacement from displacement field
@@ -1305,33 +1540,50 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
             displacement_avg = abs(np.max(u_field[:, 2]))
         
         # Energy: U = 0.5 * ∫ σ : ε dV
+        # Use computed stress tensor for accurate energy calculation
         volume = cross_sectional_area * (z_max - z_min)
         volume_per_node = volume / n_nodes if n_nodes > 0 else 0.0
         
         energy = 0.0
         for node_idx in range(n_nodes):
             epsilon_tensor_node = epsilon_tensors_final[node_idx]
+            damage_node = damage[node_idx]
+            
+            # Compute stress tensor from strain and damage
             stress_tensor_node = compute_stress_from_strain(
-                epsilon_tensor_node, damage[node_idx], material
+                epsilon_tensor_node, damage_node, material
             )
-            # Energy density: 0.5 * σ : ε
-            energy_density = 0.5 * np.sum(stress_tensor_node * epsilon_tensor_node)
+            
+            # Energy density: E = 0.5 * trace(σ · ε) = 0.5 * σ_ij · ε_ij
+            energy_density = 0.5 * np.trace(stress_tensor_node @ epsilon_tensor_node)
             energy += energy_density * volume_per_node
         
         energy = abs(energy)  # Store as positive value
         
         strains.append(float(strain_avg))
-        stresses.append(float(abs(stress_avg)))  # Store as positive (tensile strength)
+        stresses.append(float(abs(stress_avg)))  # Store as positive (tensile strength) - now using applied stress
         energies.append(float(energy))
         displacements.append(float(displacement_avg))
         forces.append(float(current_force))
-        damage_history.append(float(np.mean(damage)))
+        damage_avg = float(np.mean(damage))
+        damage_history.append(damage_avg)
         convergence_info.append({
             "damage_iterations": damage_iter + 1,
             "converged": converged,
             "damage_max": float(np.max(damage)),
-            "damage_avg": float(np.mean(damage))
+            "damage_avg": damage_avg
         })
+        
+        # Check if damage first occurred in this step
+        if not damage_first_detected and damage_avg > 1e-6:  # Small threshold to detect first damage
+            damage_first_detected = True
+            damage_first_step = step + 1
+            damage_first_force = current_force
+            damage_first_stress = abs(stress_avg)
+            print(f"\n    ⚠ DAMAGE FIRST DETECTED at Step {damage_first_step}/{sim_params.num_steps}")
+            print(f"       Force: {damage_first_force/1e3:.2f} kN ({damage_first_force:.0f} N)")
+            print(f"       Stress: {damage_first_stress/1e6:.2f} MPa")
+            print(f"       Average damage: {damage_avg:.6f}, Max damage: {np.max(damage):.6f}\n")
         
         if step % max(1, sim_params.num_steps // 5) == 0 or step == sim_params.num_steps - 1:
             status = "✓" if converged else "⚠"
@@ -1376,6 +1628,15 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
     max_energy = max(energies) if energies else 0.0
     max_force = max(forces) if forces else 0.0
     
+    # Print summary of damage initiation
+    if damage_first_detected:
+        print(f"\n  Damage Initiation Summary (Tension):")
+        print(f"    First damage detected at Step {damage_first_step}/{sim_params.num_steps}")
+        print(f"    Force at damage initiation: {damage_first_force/1e3:.2f} kN ({damage_first_force:.0f} N)")
+        print(f"    Stress at damage initiation: {damage_first_stress/1e6:.2f} MPa")
+    else:
+        print(f"\n  No damage detected during tension test (all steps completed without damage)")
+    
     return {
         "strains": strains,
         "stresses": stresses,
@@ -1389,6 +1650,9 @@ def run_tensile_test(domain, material: MaterialProperties, sim_params: Simulatio
         "cross_sectional_area_m2": cross_sectional_area,
         "total_energy_absorption": max_energy,
         "mesh": domain,
+        "damage_first_step": damage_first_step,
+        "damage_first_force_N": damage_first_force,
+        "damage_first_stress_Pa": damage_first_stress,
     }
 
 
