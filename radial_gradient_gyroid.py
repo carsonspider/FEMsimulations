@@ -29,12 +29,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple, Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy import ndimage
 from skimage import measure
 from stl import mesh
+
+# Optional matplotlib import (only needed for visualization)
+try:
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    plt = None
+    Poly3DCollection = None
 
 # Import from lib modules
 from .parameters import GyroidParameters
@@ -398,7 +406,10 @@ def create_radial_gradient_gyroid(
     
     # Visualize if requested
     if show_plot:
-        visualise_radial_gradient(params, volume, verts, faces, spacing, metadata)
+        if not HAS_MATPLOTLIB:
+            print("  ⚠ Warning: matplotlib not available, skipping visualization")
+        else:
+            visualise_radial_gradient(params, volume, verts, faces, spacing, metadata)
     
     return stl_path
 
@@ -412,6 +423,9 @@ def visualise_radial_gradient(
     metadata: Dict[str, np.ndarray],
 ):
     """Visualize radial gradient gyroid with 3D preview and radial porosity profile."""
+    if not HAS_MATPLOTLIB:
+        print("  ⚠ Warning: matplotlib not available, cannot visualize")
+        return
     lx, ly, lz = metadata["lengths"]
     
     fig = plt.figure(figsize=(16, 10))
